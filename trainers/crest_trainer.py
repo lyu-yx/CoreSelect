@@ -42,13 +42,13 @@ class CRESTTrainer(SubsetTrainer):
         for training_step in range(self.steps_per_epoch * epoch, self.steps_per_epoch * (epoch + 1)):
 
             if (training_step > self.reset_step) and ((training_step - self.reset_step) % self.args.check_interval == 0):
-                self._check_approx_error(epoch, training_step)
+                self._check_approx_error(epoch, training_step)#4.1中误差计算,check_interval is T1
 
             if training_step == self.reset_step:
-                self._select_subset(epoch, training_step)
-                self._update_train_loader_and_weights()
+                self._select_subset(epoch, training_step)#挑选coreset
+                self._update_train_loader_and_weights()#更新loader&weight
                 self.train_iter = iter(self.train_loader)
-                self._get_quadratic_approximation(epoch, training_step)
+                self._get_quadratic_approximation(epoch, training_step)#4.1中H、g近似计算
             elif training_step == 0:
                 self.train_iter = iter(self.train_loader)
 
@@ -67,7 +67,7 @@ class CRESTTrainer(SubsetTrainer):
             data_time = time.time() - data_start
             self.batch_data_time.update(data_time)
 
-            loss, train_acc = self._forward_and_backward(data, target, data_idx)
+            loss, train_acc = self._forward_and_backward(data, target, data_idx) # forward&backward ,calculate g、delta......
 
             data_start = time.time()
 
@@ -77,7 +77,6 @@ class CRESTTrainer(SubsetTrainer):
                     "training_step": training_step,
                     "train_loss": loss.item(),
                     "train_acc": train_acc})
-
 
     def _forward_and_backward(self, data, target, data_idx):
         self.optimizer.zero_grad()
