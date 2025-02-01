@@ -113,21 +113,11 @@ class BaseTrainer:
         Train the model
         """
 
-        # TODO def
-        N = args.train_size
-        times_selected = torch.zeros(N)
-
-
         # load checkpoint if resume is True
         if self.args.resume_from_epoch > 0:
             self._load_checkpoint(self.args.resume_from_epoch)
 
         for epoch in range(self.args.resume_from_epoch, self.args.epochs):
-            
-             # TODO exclude instance that has been selected "epoch" times
-            keep = np.where(times_selected[subset] == epoch)[0]
-            subset = subset[keep]
-
             self._train_epoch(epoch)
             self._val_epoch(epoch)
 
@@ -147,8 +137,6 @@ class BaseTrainer:
             if (epoch+1) % self.args.save_freq == 0:
                 self._save_checkpoint(epoch)
                 
-            # TODO make the index out here
-            times_selected[index] += 1
 
         self._save_checkpoint()
 
