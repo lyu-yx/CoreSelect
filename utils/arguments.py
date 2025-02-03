@@ -43,6 +43,7 @@ def get_args():
     parser.add_argument("--train_frac", "-s", type=float, default=0.1, help="training fraction")
     parser.add_argument("--lr_milestones", type=int, nargs='+', default=[100,150])
     parser.add_argument("--gamma", type=float, default=0.1, help="learning rate decay parameter")
+    parser.add_argument("--belta", type=float, default=0.8, help="the weight when sum feature and grad")
     parser.add_argument('--seed', default=0, type=int, help="random seed")
     parser.add_argument("--runs", type=int, help="num runs", default=1)
     parser.add_argument("--warm_start_epochs", default=20, type=int, help="epochs to warm start learning rate")

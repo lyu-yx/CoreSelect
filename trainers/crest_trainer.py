@@ -301,9 +301,9 @@ class CRESTTrainer(SubsetTrainer):
         self.random_sets = []
         self.subset = []
         self.subset_weights = []
-        for _ in range(self.args.num_minibatch_coreset):
+        for _ in range(self.args.num_minibatch_coreset):#num_minibatch_coreset = 5 (default)
             # get a random subset of the data
-            random_subset = self._select_random_set()
+            random_subset = self._select_random_set()#五个子集，每个里面从每类挑50个，总共10类，每个子集500个样本
             self.random_sets.append(random_subset)
 
         self.train_val_loader = DataLoader(
@@ -315,7 +315,7 @@ class CRESTTrainer(SubsetTrainer):
         )
         self._get_train_output()
 
-        # drop the learned data points
+        # drop the learned data points（论文中每T2间隔去掉低loss的样本）
         if self.args.drop_learned:
             self._drop_learned_data(epoch, training_step, np.concatenate(self.random_sets))
 

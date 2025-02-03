@@ -117,7 +117,7 @@ class BaseTrainer:
         if self.args.resume_from_epoch > 0:
             self._load_checkpoint(self.args.resume_from_epoch)
 
-        for epoch in range(self.args.resume_from_epoch, self.args.epochs):
+        for epoch in range(self.args.resume_from_epoch, self.args.epochs):#200 epochs, 40 batches per epoch, batchsize:128,
             self._train_epoch(epoch)
             self._val_epoch(epoch)
 

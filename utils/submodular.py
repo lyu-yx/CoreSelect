@@ -47,6 +47,53 @@ def faciliy_location_order(
 
     return class_indices[order], sz, greedy_time, S_time
 
+def facility_location_order_div_panel(
+    c, X, y, metric, num_per_class, weights=None, mode="sparse", num_n=128
+):
+    belta=0.8
+    class_indices = np.where(y == c)[0]
+    X = X[class_indices]
+    N = X.shape[0]
+    one_hot_array=np.zeros((N,X.shape[1]))
+    one_hot_array[np.arange(N),c]=1
+    X=X+(1-belta)*one_hot_array
+
+    if mode == "dense":
+        num_n = None
+
+    start = time.time()
+    obj = FacilityLocationFunction(
+        n=len(X), mode=mode, data=X, metric=metric, num_neighbors=num_n
+    )
+    S_time = time.time() - start
+
+    start = time.time()
+    greedyList = obj.maximize(
+        budget=num_per_class,
+        optimizer="LazyGreedy",
+        stopIfZeroGain=False,
+        stopIfNegativeGain=False,
+        verbose=False,
+    )
+    order = list(map(lambda x: x[0], greedyList))
+    sz = list(map(lambda x: x[1], greedyList))
+    greedy_time = time.time() - start
+
+    S  = obj.sijs
+    order = np.asarray(order, dtype=np.int64)
+    sz = np.zeros(num_per_class, dtype=np.float64)
+
+    for i in range(N):
+        if np.max(S[i, order]) <= 0:
+            continue
+        if weights is None:
+            sz[np.argmax(S[i, order])] += 1
+        else:
+            sz[np.argmax(S[i, order])] += weights[i]
+    sz[np.where(sz == 0)] = 1
+
+    return class_indices[order], sz, greedy_time, S_time
+
 
 def faciliy_location_order_sim_panel(
     c, X, y, metric, num_per_class, weights=None, mode="sparse", num_n=128
@@ -154,7 +201,7 @@ def get_orders_and_weights(
 
     order_mg_all, cluster_sizes_all, greedy_times, similarity_times = zip(
         *map(
-            lambda c: faciliy_location_order(
+            lambda c: facility_location_order_div_panel(
                 c[1], X, y, metric, num_per_class[c[0]], weights, mode, num_n
             ),
             enumerate(classes),
