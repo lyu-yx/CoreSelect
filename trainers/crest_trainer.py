@@ -1,5 +1,5 @@
 from utils import Adahessian
-
+from datasets.subset import get_coreset
 from .subset_trainer import *
 
 
@@ -44,11 +44,18 @@ class CRESTTrainer(SubsetTrainer):
             if (training_step > self.reset_step) and ((training_step - self.reset_step) % self.args.check_interval == 0):
                 self._check_approx_error(epoch, training_step)
 
+            # if epoch >= self.args.drop_after and (epoch % self.args.drop_interval == 0) and training_step == self.steps_per_epoch * epoch: # drop detrimental data at the begining of target epoch
+            #     subset = self._select_subset_drop_detrimental(epoch, training_step)
+            #     keep = np.where(self.times_selected[subset] == epoch)[0]
+            #     subset = subset[keep]
+            #     self._update_train_loader_and_weights()
+
             if training_step == self.reset_step:
-                self._select_subset(epoch, training_step)
+                self._select_subset_drop_detrimental(epoch, training_step)
                 self._update_train_loader_and_weights()
                 self.train_iter = iter(self.train_loader)
                 self._get_quadratic_approximation(epoch, training_step)
+                
             elif training_step == 0:
                 self.train_iter = iter(self.train_loader)
 
@@ -281,7 +288,84 @@ class CRESTTrainer(SubsetTrainer):
                 wandb.log({
                     'epoch': epoch,
                     'forgettable_train': len(self.train_indices)})
-            
+                
+    # def _drop_detrimental_data(self, epoch: int, training_step: int, indices: np.ndarray, preds: np.ndarray):
+    #     """
+    #     Drop the detrimental data points
+    #     :param epoch: current epoch
+    #     :param training_step: current training step
+    #     :param indices: indices of the data points that have valid predictions
+    #     """
+        
+    #     N = len(self.train_target)
+    #     B = self.args.train_frac * N / self.args.num_minibatch_coreset   # self.args.train_frac * N / nimibatch_size?
+    #     (
+    #         subset, 
+    #         subset_weights, 
+    #         _, 
+    #         _, 
+    #         cluster_,
+    #     ) = get_coreset(
+    #         preds,
+    #         self.train_target, 
+    #         N, 
+    #         B, # selected data num 
+    #     )
+    #     subset = indices[subset]
+    #     cluster = -np.ones(N, dtype=int)
+    #     cluster[indices] = cluster_
+
+    #     keep_indices = np.where(subset_weights > self.args.cluster_thresh)
+    #     if epoch >= self.args.drop_after:
+    #         keep_indices = np.where(np.isin(cluster, keep_indices))[0]
+    #         subset = keep_indices
+    #     else:
+    #         subset = np.arange(N)
+
+
+    def _drop_detrimental_data(self, epoch: int, training_step: int, indices: np.ndarray, preds):
+        """
+        Drop the detrimental data points
+        :param epoch: current epoch
+        :param training_step: current training step
+        :param indices: indices of the data points that have valid predictions
+        """
+        
+        N = len(self.train_target)
+        B = self.args.train_frac * N / self.args.num_minibatch_coreset  # Number of selected data points
+
+        # Compute coreset selection
+        subset, subset_weights, _, _, cluster_ = get_coreset(
+            preds,
+            self.train_target, 
+            N, 
+            B,
+        )
+        subset = indices[subset]  # Map selected subset back to dataset indices
+        cluster = -np.ones(N, dtype=int)  # Initialize cluster mapping
+        cluster[indices] = cluster_
+
+        # Identify keep_indices based on weight threshold
+        keep_indices = np.where(subset_weights > self.args.cluster_thresh)[0]  
+
+        if epoch >= self.args.drop_after:
+            # Keep only data points that belong to selected clusters
+            keep_indices = np.where(np.isin(cluster, keep_indices))[0]
+        else:
+            # Before drop_after epoch, use all data points
+            keep_indices = np.arange(N)
+
+        # Update train_indices to match _drop_learned_data()
+        self.train_indices = np.intersect1d(self.train_indices, keep_indices)
+
+        if self.args.use_wandb:
+            wandb.log({
+                'epoch': epoch,
+                'train_indices_after_detrimental_drop': len(self.train_indices)
+            })
+
+
+
     def _select_random_set(self) -> np.ndarray:
         indices = []
         for c in np.unique(self.train_target):
@@ -350,7 +434,78 @@ class CRESTTrainer(SubsetTrainer):
         self.random_sets = np.concatenate(self.random_sets)
 
 
+
+    def _select_subset_drop_detrimental(self, epoch: int, training_step: int):
+        """
+        Select a subset of the data, drop learned and detrimental data points
+        """
+        super()._select_subset(epoch, training_step)
+
+        # Get random subsets
+        self.random_sets = []
+        self.subset = []
+        self.subset_weights = []
+
+        # First, select random subsets
+        for _ in range(self.args.num_minibatch_coreset):
+            # Select a random subset of the data
+            random_subset = self._select_random_set()
+            self.random_sets.append(random_subset)
+
+        # Combine the indices from all random subsets
+        combined_random_sets = np.concatenate(self.random_sets)
+        
+        # Now, drop the learned data points (apply globally)
+        if self.args.drop_learned:
+            self._drop_learned_data(epoch, training_step, combined_random_sets)
+
+        # It may be preferable to update the random sets based on the updated self.train_indices.
+        # For instance, if _drop_learned_data updates self.train_indices,
+        # you could filter each random_set here:
+        self.random_sets = [np.intersect1d(rs, self.train_indices) for rs in self.random_sets]
+
+        # Update the train validation loader and get train output after dropping
+        self.train_val_loader = DataLoader(
+            Subset(self.train_dataset, indices=np.concatenate(self.random_sets)),
+            batch_size=self.args.batch_size,
+            shuffle=True,
+            num_workers=self.args.num_workers,
+            pin_memory=True,
+        )
+        self._get_train_output()
+
+        # Process each random subset individually
+        for random_set in self.random_sets:
+            # Get predictions for this subset
+            preds = self.train_softmax[random_set]
+            print(f"Epoch [{epoch}] [Greedy], pred size: {np.shape(preds)}")
+
+            # Drop the detrimental data points for this random_set
+            if self.args.drop_detrimental:
+                self._drop_detrimental_data(epoch, training_step, random_set, preds)
+                # update random_set based on the drop_detrimental result.
+                random_set = np.intersect1d(random_set, self.train_indices)
             
+            # Adjust preds by subtracting the one-hot encoded ground-truth labels
+            if np.shape(preds)[-1] == self.args.num_classes:
+                preds -= np.eye(self.args.num_classes)[self.train_target[random_set]]
+                # Now: gradient = softmax(last layer output) - one_hot
 
+            # Generate the training subset and record similarity time
+            subset, weight, _, similarity_time = self.subset_generator.generate_subset(
+                preds=preds,
+                epoch=epoch,
+                B=self.args.batch_size,
+                idx=random_set,
+                targets=self.train_target,
+                use_submodlib=(self.args.smtk == 0),
+            )
+            self.similarity_time.update(similarity_time)
+            self.subset.append(subset)
+            self.subset_weights.append(weight)
 
+        # Concatenate results from all minibatches
+        self.subset = np.concatenate(self.subset)
+        self.subset_weights = np.concatenate(self.subset_weights)
+        self.random_sets = np.concatenate(self.random_sets)
 
