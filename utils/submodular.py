@@ -10,6 +10,10 @@ def faciliy_location_order(
     class_indices = np.where(y == c)[0]
     X = X[class_indices]
     N = X.shape[0]
+    print("len(class_indices)", len(class_indices))
+    print("class_indices", class_indices)
+    print("len(y)", len(y))
+    print("c", c)
 
     if mode == "dense":
         num_n = None
@@ -171,6 +175,12 @@ def get_orders_and_weights(
       - *_sz: order points by their cluster size (largest size first)
     - weights_mg/_sz: np.array, shape [B], type float32, sums to 1
     """
+
+    # print("in normal")
+    # print('B', B)
+    # print('X', X)
+    # print('metric', metric)
+    # print('y', y)
     N = X.shape[0]
     if y is None:
         y = np.zeros(N, dtype=np.int32)  # assign every point to the same class
@@ -263,6 +273,11 @@ def get_orders_and_weights_detrimental(B, X, metric, y=None, weights=None, equal
       - *_sz: order points by their cluster size (largest size first)
     - weights_mg/_sz: np.array, shape [B], type float32, sums to 1
     '''
+    # print("in detrimental")
+    # print('B', B)
+    # print('X', X)
+    # print('metric', metric)
+    # print('y', y)
     N = X.shape[0]
     if y is None:
         y = np.zeros(N, dtype=np.int32)  # assign every point to the same class
