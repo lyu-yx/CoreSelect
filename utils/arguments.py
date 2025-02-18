@@ -90,7 +90,7 @@ def get_args():
     # detrimental example dropping
     parser.add_argument('--drop_detrimental', default=False, type=parse_bool, const=True, nargs='?', help='drop detrimental examples')
     parser.add_argument('--cluster_thresh', default=1, type=int, help='cluster size threshold')
-    parser.add_argument('--detrimental_sampled', default=128, type=int, help='number of points to select')
+    parser.add_argument('--detrimental_sampled', default=256, type=int, help='number of points to select')
     parser.add_argument('--drop_after', default=0, type=int, help='epoch to start dropping detrimental examples')
     parser.add_argument('--optimizer', default="LazyGreedy", type=str, help='optimizer for detrimental instance dropping')
 
