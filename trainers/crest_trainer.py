@@ -289,38 +289,6 @@ class CRESTTrainer(SubsetTrainer):
                     'epoch': epoch,
                     'forgettable_train': len(self.train_indices)})
                 
-    # def _drop_detrimental_data(self, epoch: int, training_step: int, indices: np.ndarray, preds: np.ndarray):
-    #     """
-    #     Drop the detrimental data points
-    #     :param epoch: current epoch
-    #     :param training_step: current training step
-    #     :param indices: indices of the data points that have valid predictions
-    #     """
-        
-    #     N = len(self.train_target)
-    #     B = self.args.train_frac * N / self.args.num_minibatch_coreset   # self.args.train_frac * N / nimibatch_size?
-    #     (
-    #         subset, 
-    #         subset_weights, 
-    #         _, 
-    #         _, 
-    #         cluster_,
-    #     ) = get_coreset(
-    #         preds,
-    #         self.train_target, 
-    #         N, 
-    #         B, # selected data num 
-    #     )
-    #     subset = indices[subset]
-    #     cluster = -np.ones(N, dtype=int)
-    #     cluster[indices] = cluster_
-
-    #     keep_indices = np.where(subset_weights > self.args.cluster_thresh)
-    #     if epoch >= self.args.drop_after:
-    #         keep_indices = np.where(np.isin(cluster, keep_indices))[0]
-    #         subset = keep_indices
-    #     else:
-    #         subset = np.arange(N)
 
 
     def _drop_detrimental_data(self, epoch: int, training_step: int, indices: np.ndarray, preds):
@@ -333,7 +301,8 @@ class CRESTTrainer(SubsetTrainer):
         :return: updated indices after dropping detrimental data.
         """
         N = len(indices)
-        B = int(self.args.train_frac * N)  # Number of selected data points
+        B = self.args.detrimental_sampled  # Number of selected data points
+        # B = int(self.args.train_frac * N)  # Number of selected data points
     
         # Compute coreset selection using the local batch.
         subset, subset_weights, _, _, cluster_ = get_coreset(
@@ -492,7 +461,7 @@ class CRESTTrainer(SubsetTrainer):
             # Make a local copy so that we do not affect the global self.random_sets.
             local_set = orig_random_set.copy()
             # (Optional) Ensure local_set is within the valid index domain.
-            local_set = np.intersect1d(local_set, np.arange(len(self.train_target)))
+            # local_set = np.intersect1d(local_set, np.arange(len(self.train_target)))
             
             # Get predictions for the local set.
             preds = self.train_softmax[local_set]
