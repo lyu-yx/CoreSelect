@@ -48,9 +48,31 @@ def faciliy_location_order(
 
     return class_indices[order], sz, greedy_time, S_time
 
+def normalize(scores):
+    if(np.max(scores)/sum(scores) >= 0.1):
+        max_idx = np.argmax(scores)
+        scores_cp = scores
+        scores_cp = np.delete(scores_cp,max_idx)
+        min_val, max_val = np.min(scores_cp),  np.max(scores_cp)
+        scores = (scores - min_val) / (max_val - min_val + 1e-8)
+        scores[max_idx] = 1 
+        return scores
+    else:
+        min_val, max_val = np.min(scores), np.max(scores)
+        return (scores - min_val) / (max_val - min_val + 1e-8)
+        
+def rerank(vec,N):
+    i=0
+    rank = np.zeros(N)
+    for elem in vec:
+        rank[elem] = i
+        i+=1
+    return rank
+        
 def facility_location_order_div_panel(
     c, X, y, metric, num_per_class, weights=None, mode="sparse", num_n=128
 ):
+    flag=2         #      0----sz      1----rank    2----pure div
     alpha = 0.7
     class_indices = np.where(y == c)[0]
     X = X[class_indices]
@@ -59,15 +81,18 @@ def facility_location_order_div_panel(
     if mode == "dense":
         num_n = None
     #----------------Cover----------------- 
-    start = time.time()
+    #start = time.time()
+    '''
     obj_cov = FacilityLocationFunction(
         n=len(X), mode=mode, data=X, metric=metric, num_neighbors=num_n
     )
-    S_time = time.time() - start
-
+    
+    
+   # S_time = time.time() - start
+    
     start = time.time()
     greedyList_cov = obj_cov.maximize(
-        budget=N,
+        budget=N-1,
         optimizer="LazyGreedy",
         stopIfZeroGain=False,
         stopIfNegativeGain=False,
@@ -76,28 +101,47 @@ def facility_location_order_div_panel(
     order_cov = list(map(lambda x: x[0], greedyList_cov))
     sz_cov = list(map(lambda x: x[1], greedyList_cov)) #weight of sample
     greedy_time = time.time() - start
+    '''
 
     #-----------Diversity------------
-    obj_div = DisparitySumFunction(n=len(X), mode=mode, metric=metric, num_neighbors=num_n)
+    start = time.time()
+    obj_div = DisparitySumFunction(n=len(X), mode=mode, data=X, metric=metric, num_neighbors=num_n)
+    S_time = time.time() - start
+    start = time.time()
     greedyList_div = obj_div.maximize(
-        budget=N,
-        optimizer="LazyGreedy",
+        budget=num_per_class,
+        optimizer="NaiveGreedy",
         stopIfZeroGain=False,
         stopIfNegativeGain=False,
         verbose=False,
     )
     order_div = list(map(lambda x:x[0], greedyList_div))
     sz_div = list(map(lambda x:x[1],greedyList_div))
-    #-----------Norm & sort-----------
-    def normalize(scores):
-        min_val, max_val = np.min(scores), np.max(scores)
-        return (scores - min_val) / (max_val - min_val + 1e-8)
-    cov_norm = normalize(sz_cov)
-    div_norm = normalize(sz_div)
-    final_score = alpha*cov_norm + (1-alpha)*div_norm
-    sort_indices = np.argsort(final_score)
-    order = sort_indices[:num_per_class]
-    S = obj_cov.sijs
+    sz_div.reverse()
+    greedy_time = time.time() - start
+    if(flag == 0):     # TODO:直接正则化效果不佳，两种排序的sz的比例不一致，比如cov中第一个sz会很大，而div中相对平均
+        #-----------Norm & sort-----------
+        cov_scores = np.zeros(N)
+        div_scores = np.zeros(N)
+        for idx, score in zip(order_cov, sz_cov):
+            cov_scores[idx] = score
+        for idx, score in zip(order_div, sz_div):
+            div_scores[idx] = score
+        cov_norm = normalize(cov_scores)
+        div_norm = normalize(div_scores)
+        final_score = alpha*cov_norm + (1-alpha)*div_norm
+        sort_indices = np.argsort(final_score)[::-1]
+        order = sort_indices[:num_per_class]
+    elif(flag == 1):
+       #----------Sort-------------
+        cov_rank = rerank(order_cov,N)
+        div_rank = rerank(order_div,N)
+        rank = np.floor((cov_rank + div_rank)/2)
+        sort_indices = np.argsort(rank)
+        order = sort_indices[:num_per_class]
+    elif(flag == 2):
+        order = order_div 
+    S = obj_div.sijs
     order = np.asarray(order, dtype=np.int64)
     sz = np.zeros(num_per_class, dtype=np.float64)
 
@@ -218,7 +262,7 @@ def get_orders_and_weights(
 
     order_mg_all, cluster_sizes_all, greedy_times, similarity_times = zip(
         *map(
-            lambda c: faciliy_location_order(
+            lambda c: facility_location_order_div_panel(
                 c[1], X, y, metric, num_per_class[c[0]], weights, mode, num_n
             ),
             enumerate(classes),
