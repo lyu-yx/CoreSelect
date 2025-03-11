@@ -3,6 +3,8 @@ import time
 import numpy as np
 from submodlib.functions.facilityLocation import FacilityLocationFunction
 from submodlib.functions.disparitySum import DisparitySumFunction
+from submodlib.functions.disparityMin import DisparityMinFunction
+from submodlib.functions.setCover import SetCoverFunction
 
 
 def faciliy_location_order(
@@ -49,7 +51,7 @@ def faciliy_location_order(
     return class_indices[order], sz, greedy_time, S_time
 
 def normalize(scores):
-    if(np.max(scores)/sum(scores) >= 0.1):
+    if(np.max(scores)/sum(scores) >= 0.5):
         max_idx = np.argmax(scores)
         scores_cp = scores
         scores_cp = np.delete(scores_cp,max_idx)
@@ -72,8 +74,8 @@ def rerank(vec,N):
 def facility_location_order_div_panel(
     c, X, y, metric, num_per_class, weights=None, mode="sparse", num_n=128
 ):
-    flag=2         #      0----sz      1----rank    2----pure div
-    alpha = 0.7
+    flag=0         #      0----sz      1----rank    2----pure div
+    alpha = 0.9
     class_indices = np.where(y == c)[0]
     X = X[class_indices]
     N = X.shape[0]
@@ -82,7 +84,7 @@ def facility_location_order_div_panel(
         num_n = None
     #----------------Cover----------------- 
     #start = time.time()
-    '''
+    
     obj_cov = FacilityLocationFunction(
         n=len(X), mode=mode, data=X, metric=metric, num_neighbors=num_n
     )
@@ -101,7 +103,7 @@ def facility_location_order_div_panel(
     order_cov = list(map(lambda x: x[0], greedyList_cov))
     sz_cov = list(map(lambda x: x[1], greedyList_cov)) #weight of sample
     greedy_time = time.time() - start
-    '''
+    
 
     #-----------Diversity------------
     start = time.time()
@@ -109,7 +111,7 @@ def facility_location_order_div_panel(
     S_time = time.time() - start
     start = time.time()
     greedyList_div = obj_div.maximize(
-        budget=num_per_class,
+        budget=N-1,
         optimizer="NaiveGreedy",
         stopIfZeroGain=False,
         stopIfNegativeGain=False,
@@ -165,53 +167,132 @@ def faciliy_location_order_sim_panel(
 
     if mode == "dense":
         num_n = None
-
-    # Initialize the facility location objective
-    obj = FacilityLocationFunction(
+    #----------------Cover----------------- 
+    #start = time.time()
+    
+    obj_cov = FacilityLocationFunction(
         n=len(X), mode=mode, data=X, metric=metric, num_neighbors=num_n
     )
-    S = obj.sijs  # Similarity matrix or graph
-
-    # Greedy selection with diversity consideration
-    selected_indices = []
-    selected_scores = []
-    available_indices = set(range(N))
     
-    for _ in range(num_per_class):
-        max_gain = -np.inf
-        best_index = -1
+    
+   # S_time = time.time() - start
+    
+    start = time.time()
+    num_first_stage = np.ceil(min(1.5*num_per_class,N-1)).astype(int)
+    num_second_stage = np.ceil(min(1.2*num_per_class,N-1)).astype(int)
+    greedyList_cov = obj_cov.maximize(
+        budget=num_first_stage,
+        optimizer="LazyGreedy",
+        stopIfZeroGain=False,
+        stopIfNegativeGain=False,
+        verbose=False,
+    )
+    order_cov = list(map(lambda x: x[0], greedyList_cov))
+    sz_cov = list(map(lambda x: x[1], greedyList_cov)) #weight of sample
+    greedy_time = time.time() - start
+    
 
-        for i in available_indices:
-            # Compute diversity penalty
-            diversity_penalty = (
-                np.max(S[i, selected_indices]) if selected_indices else 0
-            )
-
-            # Compute adjusted gain (similarity - diversity)
-            gain = S[i, :].sum() - diversity_penalty
-
-            if gain > max_gain:
-                max_gain = gain
-                best_index = i
-
-        # Add the best index to the selected subset
-        selected_indices.append(best_index)
-        selected_scores.append(max_gain)
-        available_indices.remove(best_index)
-
-    # Compute cluster sizes (sz)
+    #-----------Diversity------------
+    start = time.time()   # TODO:不在cov的基础上直接div排序，要考虑cov中不同元素的weight
+    obj_div = DisparitySumFunction(n=num_first_stage, mode=mode, data=X[order_cov], metric=metric, num_neighbors=num_n)
+    S_time = time.time() - start
+    start = time.time()
+    greedyList_div = obj_div.maximize(
+        budget=num_per_class,
+        optimizer="NaiveGreedy",
+        stopIfZeroGain=False,
+        stopIfNegativeGain=False,
+        verbose=False,
+    )
+    order_div = list(map(lambda x:x[0], greedyList_div))
+    sz_div = list(map(lambda x:x[1],greedyList_div))
+    sz_div.reverse()
+    greedy_time = time.time() - start
+    #--------------second cov----------------
+    # obj_cov_2 = FacilityLocationFunction(
+    #     n=num_second_stage, mode=mode, data=X[[order_cov[i] for i in order_div]], metric=metric, num_neighbors=num_n
+    # )
+    # greedyList_cov_2 = obj_cov_2.maximize(
+    #     budget=num_per_class,
+    #     optimizer="LazyGreedy",
+    #     stopIfZeroGain=False,
+    #     stopIfNegativeGain=False,
+    #     verbose=False,
+    # )
+    # order_cov_2 = list(map(lambda x: x[0], greedyList_cov_2))
+    # sz_cov_2 = list(map(lambda x: x[1], greedyList_cov_2)) #weight of sample
+    # order_tem = [order_div[i] for i in order_cov_2]
+    # order = [order_cov[j] for j in order_tem]
+    #-----------Norm & sort-----------
+    cov_scores = np.zeros(N)
+    div_scores = np.zeros(N)
+    for idx, score in zip(order_cov, sz_cov):
+        cov_scores[idx] = score
+    for idx, score in zip(order_div, sz_div):
+        div_scores[order_cov[idx]] = score
+    cov_norm = normalize(cov_scores)
+    div_norm = normalize(div_scores)
+    final_score = 0.9*cov_norm + 0.1*div_norm
+    order = np.argsort(final_score)[::-1]
+    #order=[order_cov[i] for i in order_div]
+    order = order[:num_per_class]
+    S = obj_cov.sijs
+    order = np.asarray(order, dtype=np.int64)
     sz = np.zeros(num_per_class, dtype=np.float64)
+
     for i in range(N):
-        if np.max(S[i, selected_indices]) <= 0:
+        if np.max(S[i, order]) <= 0:
             continue
         if weights is None:
-            sz[np.argmax(S[i, selected_indices])] += 1
+            sz[np.argmax(S[i, order])] += 1
         else:
-            sz[np.argmax(S[i, selected_indices])] += weights[i]
+            sz[np.argmax(S[i, order])] += weights[i]
     sz[np.where(sz == 0)] = 1
 
-    return class_indices[selected_indices], sz, 0, 0  # Timing placeholders
+    return class_indices[order], sz, greedy_time, S_time
 
+def faciliy_location_order_min(    #Apply the setcoverfunction
+    c, X, y, metric, num_per_class, weights=None, mode="sparse", num_n=128
+):
+    class_indices = np.where(y == c)[0]
+    X = X[class_indices]
+    N = X.shape[0]
+
+    if mode == "dense":
+        num_n = None
+
+    start = time.time()
+    obj = DisparityMinFunction(
+        n=len(X), mode=mode, data=X, metric=metric, num_neighbors=num_n
+    )
+    S_time = time.time() - start
+
+    start = time.time()
+    greedyList = obj.maximize(
+        budget=num_per_class,
+        optimizer="LazyGreedy",
+        stopIfZeroGain=False,
+        stopIfNegativeGain=False,
+        verbose=False,
+    )
+    order = list(map(lambda x: x[0], greedyList))
+    sz = list(map(lambda x: x[1], greedyList)) #weight of sample
+    greedy_time = time.time() - start
+
+    S = obj.sijs
+    order = np.asarray(order, dtype=np.int64)
+    sz = np.zeros(num_per_class, dtype=np.float64)
+
+    for i in range(N):
+        if np.max(S[i, order]) <= 0:
+            continue
+        if weights is None:
+            sz[np.argmax(S[i, order])] += 1
+        else:
+            sz[np.argmax(S[i, order])] += weights[i]
+    sz[np.where(sz == 0)] = 1
+
+    return class_indices[order], sz, greedy_time, S_time
 
 def get_orders_and_weights(
     B,
@@ -262,7 +343,7 @@ def get_orders_and_weights(
 
     order_mg_all, cluster_sizes_all, greedy_times, similarity_times = zip(
         *map(
-            lambda c: facility_location_order_div_panel(
+            lambda c: faciliy_location_order_min(
                 c[1], X, y, metric, num_per_class[c[0]], weights, mode, num_n
             ),
             enumerate(classes),

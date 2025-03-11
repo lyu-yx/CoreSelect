@@ -31,7 +31,7 @@ def get_args():
     parser.add_argument("--momentum", "-m", type=float, default=0.9, help="momentum")
     parser.add_argument("--weight-decay", "--wd", default=1e-4, type=float,
         help="weight decay (default: 5e-4)")
-    parser.add_argument("--save-dir", default="./outputs/CREST_div", type=str,
+    parser.add_argument("--save-dir", default="./outputs/CREST_min", type=str,
         help="The directory used to save output")
     parser.add_argument("--save_freq", type=int, default=20,
         help="Saves checkpoints at every specified number of epochs")
