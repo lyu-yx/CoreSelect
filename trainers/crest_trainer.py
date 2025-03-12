@@ -1,20 +1,22 @@
 from utils import Adahessian
-from datasets.subset import get_coreset
+
 from .subset_trainer import *
+from utils import Adahessian
 
 
 class CRESTTrainer(SubsetTrainer):
     def __init__(
-        self, 
-        args: argparse.Namespace,
-        model: nn.Module,
-        train_dataset: IndexedDataset,
-        val_loader: DataLoader,
-        train_weights: torch.Tensor = None,
+            self,
+            args: argparse.Namespace,
+            model: nn.Module,
+            train_dataset: IndexedDataset,
+            val_loader: DataLoader,
+            train_weights: torch.Tensor = None,
     ):
         super().__init__(args, model, train_dataset, val_loader, train_weights)
         self.train_indices = np.arange(len(self.train_dataset))
-        self.steps_per_epoch = np.ceil(int(len(self.train_dataset) * self.args.train_frac) / self.args.batch_size).astype(int)
+        self.steps_per_epoch = np.ceil(
+            int(len(self.train_dataset) * self.args.train_frac) / self.args.batch_size).astype(int)
         self.reset_step = self.steps_per_epoch
         self.random_sets = np.array([])
 
@@ -41,21 +43,15 @@ class CRESTTrainer(SubsetTrainer):
 
         for training_step in range(self.steps_per_epoch * epoch, self.steps_per_epoch * (epoch + 1)):
 
-            if (training_step > self.reset_step) and ((training_step - self.reset_step) % self.args.check_interval == 0):
+            if (training_step > self.reset_step) and (
+                    (training_step - self.reset_step) % self.args.check_interval == 0):
                 self._check_approx_error(epoch, training_step)
 
-            # if epoch >= self.args.drop_after and (epoch % self.args.drop_interval == 0) and training_step == self.steps_per_epoch * epoch: # drop detrimental data at the begining of target epoch
-            #     subset = self._select_subset_drop_detrimental(epoch, training_step)
-            #     keep = np.where(self.times_selected[subset] == epoch)[0]
-            #     subset = subset[keep]
-            #     self._update_train_loader_and_weights()
-
             if training_step == self.reset_step:
-                self._select_subset_drop_detrimental(epoch, training_step)
+                self._select_subset(epoch, training_step)
                 self._update_train_loader_and_weights()
                 self.train_iter = iter(self.train_loader)
                 self._get_quadratic_approximation(epoch, training_step)
-                
             elif training_step == 0:
                 self.train_iter = iter(self.train_loader)
 
@@ -85,7 +81,6 @@ class CRESTTrainer(SubsetTrainer):
                     "train_loss": loss.item(),
                     "train_acc": train_acc})
 
-
     def _forward_and_backward(self, data, target, data_idx):
         self.optimizer.zero_grad()
 
@@ -104,7 +99,7 @@ class CRESTTrainer(SubsetTrainer):
             self.model.zero_grad()
             # approximate with hessian diagonal
             loss.backward(create_graph=True)
-            gf_current, _, _ = self.gradient_approx_optimizer.step(momentum=False)                   
+            gf_current, _, _ = self.gradient_approx_optimizer.step(momentum=False)
             self.delta -= lr * gf_current
 
         backward_start = time.time()
@@ -119,7 +114,6 @@ class CRESTTrainer(SubsetTrainer):
         self.train_acc.update(train_acc, data.size(0))
 
         return loss, train_acc
-
 
     def _get_quadratic_approximation(self, epoch: int, training_step: int):
         """
@@ -159,7 +153,7 @@ class CRESTTrainer(SubsetTrainer):
 
             # compute output
             output = self.model(input_var)
-                
+
             if self.args.approx_with_coreset:
                 loss = self.train_criterion(output, target_var)
                 batch_weight = self.train_weights[idx.long()]
@@ -198,11 +192,13 @@ class CRESTTrainer(SubsetTrainer):
             self.ggf = self.ggf_moment
 
         if training_step == self.steps_per_epoch:
-            self.init_curvature_norm = gff_norm 
+            self.init_curvature_norm = gff_norm
         else:
             self.args.check_interval = int(torch.ceil(self.init_curvature_norm / gff_norm * self.args.interval_mul))
-            self.args.num_minibatch_coreset = min(self.args.check_interval * self.args.batch_num_mul, self.steps_per_epoch)
-        self.args.logger.info(f"Checking interval {self.args.check_interval}. Number of minibatch coresets {self.args.num_minibatch_coreset}")
+            self.args.num_minibatch_coreset = min(self.args.check_interval * self.args.batch_num_mul,
+                                                  self.steps_per_epoch)
+        self.args.logger.info(
+            f"Checking interval {self.args.check_interval}. Number of minibatch coresets {self.args.num_minibatch_coreset}")
         if self.args.use_wandb:
             wandb.log({
                 'epoch': epoch,
@@ -211,7 +207,7 @@ class CRESTTrainer(SubsetTrainer):
                 'check_interval': self.args.check_interval,
                 'num_minibatch_coreset': self.args.num_minibatch_coreset})
 
-    def _check_approx_error(self, epoch:int, training_step: int) -> torch.Tensor:
+    def _check_approx_error(self, epoch: int, training_step: int) -> torch.Tensor:
         """
         Check the approximation error of the current batch
         :param epoch: current epoch
@@ -221,10 +217,10 @@ class CRESTTrainer(SubsetTrainer):
         start_compare = time.time()
         self._get_train_output()
         true_loss = self.val_criterion(
-            torch.from_numpy(self.train_output[self.random_sets]), 
+            torch.from_numpy(self.train_output[self.random_sets]),
             torch.from_numpy(self.train_target[self.random_sets])
-            )
-        
+        )
+
         delta_norm = torch.norm(self.delta)
 
         approx_loss = torch.matmul(self.delta, self.gf) + self.start_loss
@@ -234,7 +230,7 @@ class CRESTTrainer(SubsetTrainer):
         thresh = self.args.check_thresh_factor * true_loss
 
         log_str = f"Iter {training_step} loss difference {loss_diff:.3f} threshold {thresh:.3f} True loss {true_loss:.3f} Approx loss {approx_loss.item():.3f} Delta norm {delta_norm:.3f}"
-            
+
         if loss_diff > thresh:
             self.reset_step = training_step
             log_str += f" is larger than threshold {thresh:.3f}. "
@@ -247,11 +243,11 @@ class CRESTTrainer(SubsetTrainer):
             wandb.log({
                 'epoch': epoch,
                 'training_step': training_step,
-                'loss_diff': loss_diff, 
+                'loss_diff': loss_diff,
                 'loss_thresh': thresh,
                 'delta_norm': delta_norm,
                 'num_checking': self.num_checking})
-            
+
     def _drop_learned_data(self, epoch: int, training_step: int, indices: np.ndarray):
         """
         Drop the learned data points
@@ -259,15 +255,13 @@ class CRESTTrainer(SubsetTrainer):
         :param training_step: current training step
         :param indices: indices of the data points that have valid predictions
         """
-        
+
         self.loss_watch[epoch % self.args.watch_interval, indices] = self.train_criterion(
             torch.from_numpy(self.train_output[indices]), torch.from_numpy(self.train_target[indices]).long()).numpy()
-                        
-        if ((epoch+1) % self.args.drop_interval == 0):
-            # 1. identifies data points that have large loss values or Untracked instance.
-            # 2. selects a subset of the data points above selected set.
-            order_ = np.where(np.sum(self.loss_watch>self.args.drop_thresh, axis=0)>0)[0]
-            unselected = np.where(np.sum(self.loss_watch>=0, axis=0)==0)[0]
+
+        if ((epoch + 1) % self.args.drop_interval == 0):
+            order_ = np.where(np.sum(self.loss_watch > self.args.drop_thresh, axis=0) > 0)[0]
+            unselected = np.where(np.sum(self.loss_watch >= 0, axis=0) == 0)[0]
             order_ = np.concatenate([order_, unselected])
 
             order = []
@@ -280,7 +274,7 @@ class CRESTTrainer(SubsetTrainer):
                     class_indices = np.intersect1d(np.where(self.train_target == c)[0], self.train_indices)
                     order.append(class_indices)
             order = np.concatenate(order)
-            
+
             if len(order) > self.args.min_train_size:
                 self.train_indices = order
 
@@ -288,61 +282,13 @@ class CRESTTrainer(SubsetTrainer):
                 wandb.log({
                     'epoch': epoch,
                     'forgettable_train': len(self.train_indices)})
-                
-
-
-    def _drop_detrimental_data(self, epoch: int, training_step: int, indices: np.ndarray, preds):
-        """
-        Drop the detrimental data points and return the updated indices.
-        :param epoch: current epoch
-        :param training_step: current training step
-        :param indices: indices of the data points that have valid predictions
-        :param preds: predictions corresponding to those indices
-        :return: updated indices after dropping detrimental data.
-        """
-        N = len(indices)
-        B = self.args.detrimental_sampled  # Number of selected data points
-        # B = int(self.args.train_frac * N)  # Number of selected data points
-    
-        # Compute coreset selection using the local batch.
-        subset, subset_weights, _, _, cluster_ = get_coreset(
-            preds,
-            self.train_target[indices],
-            N,
-            B,
-            self.args.num_classes,
-        )
-        # Map the selected subset back to global indices.
-        subset = indices[subset]
-        # Create a cluster mapping for the full dataset.
-        cluster = -np.ones(len(self.train_target), dtype=int)
-        cluster[indices] = cluster_
-        
-        # Identify indices to keep based on the weight threshold.
-        keep_indices = np.where(subset_weights > self.args.cluster_thresh)[0]
-        if epoch >= self.args.drop_after:
-            # Keep only data points that belong to the selected clusters.
-            keep_indices = np.where(np.isin(cluster, keep_indices))[0]
-        else:
-            keep_indices = indices
-    
-        # Instead of updating self.train_indices globally, return the local updated indices.
-        updated_indices = np.intersect1d(indices, keep_indices)
-        if self.args.use_wandb:
-            wandb.log({
-                'epoch': epoch,
-                'detrimental_drop_count': len(updated_indices)
-            })
-        return updated_indices
-
-
-
 
     def _select_random_set(self) -> np.ndarray:
         indices = []
         for c in np.unique(self.train_target):
             class_indices = np.intersect1d(np.where(self.train_target == c)[0], self.train_indices)
-            indices_per_class = np.random.choice(class_indices, size=int(np.ceil(self.args.random_subset_size * self.args.train_size / self.args.num_classes)), replace=False)
+            indices_per_class = np.random.choice(class_indices, size=int(
+                np.ceil(self.args.random_subset_size * self.args.train_size / self.args.num_classes)), replace=False)
             indices.append(indices_per_class)
         indices = np.concatenate(indices)
 
@@ -362,7 +308,7 @@ class CRESTTrainer(SubsetTrainer):
             # get a random subset of the data
             random_subset = self._select_random_set()
             self.random_sets.append(random_subset)
-        # print('self.random_sets[0]', self.random_sets[0])
+
         self.train_val_loader = DataLoader(
             Subset(self.train_dataset, indices=np.concatenate(self.random_sets)),
             batch_size=self.args.batch_size,
@@ -375,31 +321,63 @@ class CRESTTrainer(SubsetTrainer):
         # drop the learned data points
         if self.args.drop_learned:
             self._drop_learned_data(epoch, training_step, np.concatenate(self.random_sets))
-        # print('self.random_sets[0]', self.random_sets[0])
+
         for random_set in self.random_sets:
-            preds = self.train_softmax[random_set]
+            # Convert to torch tensors and ensure they require gradients
+            train_softmax_tensor = torch.tensor(self.train_softmax[random_set], dtype=torch.float32, requires_grad=True)
+            train_target_tensor = torch.tensor(self.train_target[random_set], dtype=torch.long)
+
+            preds = train_softmax_tensor
+
             print(f"Epoch [{epoch}] [Greedy], pred size: {np.shape(preds)}")
             if np.shape(preds)[-1] == self.args.num_classes:
-                preds -= np.eye(self.args.num_classes)[self.train_target[random_set]]   # subtracting the one-hot encoded ground-truth labels
-                # gradient is here: g = softmax(last layer output) - one_hot
+                # Use Hessian Vector Product (HVP) instead of direct Hessian calculation
+                grads = preds - torch.eye(self.args.num_classes)[train_target_tensor]
 
-            (
-                subset,
-                weight,
-                _,
-                similarity_time,
-            ) = self.subset_generator.generate_subset(
-                preds=preds,
-                epoch=epoch,
-                B=self.args.batch_size,
-                idx=random_set,
-                targets=self.train_target,
-                use_submodlib=(self.args.smtk==0),
-            )
-            self.similarity_time.update(similarity_time)
+                batch_size, num_classes = grads.shape
 
-            self.subset.append(subset)
-            self.subset_weights.append(weight)
+                # Generate random vectors for HVP
+                v = [2 * torch.randint_like(torch.tensor(p, dtype=torch.float32), high=2) - 1 for p in
+                     train_softmax_tensor]
+
+                # Calculate Hessian Vector Product (HVP) using autograd
+                hvs = torch.autograd.grad(grads, train_softmax_tensor,
+                                          grad_outputs=torch.randint(0, 2, (500, 10)) * 2 - 1, only_inputs=True,
+                                          retain_graph=True)
+
+                # Accumulate the reduced gradients and hessian vectors
+                reduced_grads = []
+                hutchinson_trace = []
+                for grad, hv, vi in zip(grads, hvs, v):
+                    tmp_output = hv * vi
+                    tmp_grad = grad
+
+                    hutchinson_trace.append(tmp_output.detach())  # Detach before numpy
+                    reduced_grads.append(tmp_grad.detach().flatten())
+
+                hutchinson_trace = torch.cat(hutchinson_trace).detach()
+                reduced_grads = torch.cat(reduced_grads).detach()
+
+                # Now, use the reduced gradients and hessian vector product for further operations
+                result = np.zeros((batch_size, num_classes), dtype=np.float64)
+
+                for i in range(batch_size):
+                    # Ensure tensors are detached before calling numpy
+                    result[i] = np.dot(hutchinson_trace[i].detach().numpy(),
+                                       preds[i].detach().numpy())  # Detach before numpy
+
+                subset, weight, _, similarity_time = self.subset_generator.generate_subset(
+                    preds=result,
+                    epoch=epoch,
+                    B=self.args.batch_size,
+                    idx=random_set,
+                    targets=self.train_target,
+                    use_submodlib=(self.args.smtk == 0),
+                )
+                self.similarity_time.update(similarity_time)
+
+                self.subset.append(subset)
+                self.subset_weights.append(weight)
 
         self.subset = np.concatenate(self.subset)
         self.subset_weights = np.concatenate(self.subset_weights)
@@ -407,100 +385,9 @@ class CRESTTrainer(SubsetTrainer):
 
 
 
-    def _select_subset_drop_detrimental(self, epoch: int, training_step: int):
-        """
-        Select a subset of the data, and drop learned and detrimental data points.
-        """
-        # Call the superclass method if needed.
-        super()._select_subset(epoch, training_step)
-    
-        # ----------------------------
-        # 1. Select random subsets
-        # ----------------------------
-        self.random_sets = []
-        self.subset = []
-        self.subset_weights = []
-        
-        for _ in range(self.args.num_minibatch_coreset):
-            # Select a random subset of global indices.
-            random_subset = self._select_random_set()
-            self.random_sets.append(random_subset)
-        
-        # Combine all indices for global learned data dropping.
-        combined_random_sets = np.concatenate(self.random_sets)
-        
-        # ----------------------------
-        # 2. Drop learned data points globally
-        # ----------------------------
-        if self.args.drop_learned:
-            # This updates self.train_indices based on loss values.
-            self._drop_learned_data(epoch, training_step, combined_random_sets)
-        
-        # Filter each random set so they contain only indices in self.train_indices.
-        self.random_sets = [np.intersect1d(rs, self.train_indices) for rs in self.random_sets]
-        
-        # Update the DataLoader based on the filtered indices.
-        self.train_val_loader = DataLoader(
-            Subset(self.train_dataset, indices=np.concatenate(self.random_sets)),
-            batch_size=self.args.batch_size,
-            shuffle=True,
-            num_workers=self.args.num_workers,
-            pin_memory=True,
-        )
-        
-        self._get_train_output()  # Update self.train_output and self.train_softmax, if needed.
-        
-        # ----------------------------
-        # 3. Process each random subset individually
-        # ----------------------------
-        updated_random_sets = []
-        processed_subsets = []
-        processed_weights = []
-        
-        for orig_random_set in self.random_sets:
-            # Make a local copy so that we do not affect the global self.random_sets.
-            local_set = orig_random_set.copy()
-            # (Optional) Ensure local_set is within the valid index domain.
-            # local_set = np.intersect1d(local_set, np.arange(len(self.train_target)))
-            
-            # Get predictions for the local set.
-            preds = self.train_softmax[local_set]
-            print(f"Epoch [{epoch}] [Greedy], initial pred shape: {np.shape(preds)}")
-            
-            # Drop detrimental data for this local set if enabled.
-            if self.args.drop_detrimental:
-                local_set = self._drop_detrimental_data(epoch, training_step, local_set, preds)
-                # Recompute predictions using the updated local_set.
-                preds = self.train_softmax[local_set]
-                print(f"Epoch [{epoch}] [Greedy], after detrimental drop, pred shape: {np.shape(preds)}")
-            
-            # Subtract one-hot encoded ground-truth labels if shapes match.
-            if np.shape(preds)[-1] == self.args.num_classes:
-                one_hot_labels = np.eye(self.args.num_classes)[self.train_target[local_set]]
-                if one_hot_labels.shape[0] != preds.shape[0]:
-                    print(f"Shape mismatch: preds {preds.shape} vs one_hot {one_hot_labels.shape}")
-                preds = preds - one_hot_labels
-            
-            # Generate the training subset for this local set.
-            subset, weight, _, similarity_time = self.subset_generator.generate_subset(
-                preds=preds,
-                epoch=epoch,
-                B=self.args.batch_size,
-                idx=local_set,
-                targets=self.train_target,
-                use_submodlib=(self.args.smtk == 0),
-            )
-            self.similarity_time.update(similarity_time)
-            processed_subsets.append(subset)
-            processed_weights.append(weight)
-            
-            # Save the updated local set.
-            updated_random_sets.append(local_set)
-        
-        # Update global variables after processing.
-        self.random_sets = np.concatenate(updated_random_sets)
-        self.subset = np.concatenate(processed_subsets)
-        self.subset_weights = np.concatenate(processed_weights)
+
+
+
 
 
 
