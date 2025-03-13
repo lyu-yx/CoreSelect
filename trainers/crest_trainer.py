@@ -41,8 +41,8 @@ class CRESTTrainer(SubsetTrainer):
 
         for training_step in range(self.steps_per_epoch * epoch, self.steps_per_epoch * (epoch + 1)):
 
-            if (training_step > self.reset_step) and ((training_step - self.reset_step) % self.args.check_interval == 0):
-                self._check_approx_error(epoch, training_step)
+            # if (training_step > self.reset_step) and ((training_step - self.reset_step) % self.args.check_interval == 0):
+            #     self._check_approx_error(epoch, training_step)
 
             # if epoch >= self.args.drop_after and (epoch % self.args.drop_interval == 0) and training_step == self.steps_per_epoch * epoch: # drop detrimental data at the begining of target epoch
             #     subset = self._select_subset_drop_detrimental(epoch, training_step)
@@ -50,7 +50,7 @@ class CRESTTrainer(SubsetTrainer):
             #     subset = subset[keep]
             #     self._update_train_loader_and_weights()
 
-            if training_step == self.reset_step:
+            if training_step % self.steps_per_epoch == 0 and training_step >= self.steps_per_epoch:
                 self._select_subset_drop_detrimental(epoch, training_step)
                 self._update_train_loader_and_weights()
                 self.train_iter = iter(self.train_loader)
