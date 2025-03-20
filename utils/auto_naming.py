@@ -10,7 +10,7 @@ def get_exp_name(args):
     subset_size = args.train_frac
     args.save_dir += f"_train{subset_size:.2f}"
     if args.random_subset_size < 1.:
-        args.save_dir += f"_random{args.random_subset_size:.2f}-start{args.partition_start}"
+        args.save_dir += f"_random{args.random_subset_size:.3f}-start{args.partition_start}"
     grd += f'_dropevery{args.drop_interval}-loss{args.drop_thresh}-watch{args.watch_interval}' if args.drop_learned else ''
     args.save_dir += f"_batchsize{args.batch_size}_{grd}"
     if args.selection_method == 'crest':

@@ -66,6 +66,7 @@ args.logger.info("Arguments: {}".format(args))
 args.logger.info("Time: {}".format(time.strftime("%Y-%m-%d %H:%M:%S")))
 
 def main(args):
+    torch.cuda.empty_cache()
     train_dataset = IndexedDataset(args, train=True, train_transform=True)
     args.train_size = len(train_dataset)
     val_loader = torch.utils.data.DataLoader(

@@ -41,10 +41,10 @@ class CRESTTrainer(SubsetTrainer):
 
         for training_step in range(self.steps_per_epoch * epoch, self.steps_per_epoch * (epoch + 1)):
 
-            if (training_step > self.reset_step) and ((training_step - self.reset_step) % self.args.check_interval == 0):
-                self._check_approx_error(epoch, training_step)#4.1中误差计算,check_interval is T1
+            # if (training_step > self.reset_step) and ((training_step - self.reset_step) % self.args.check_interval == 0):
+            #     self._check_approx_error(epoch, training_step)#4.1中误差计算,check_interval is T1
 
-            if training_step == self.reset_step:
+            if training_step % 10 == 0 and training_step >= 10:
                 self._select_subset(epoch, training_step)#挑选coreset
                 self._update_train_loader_and_weights()#更新loader&weight
                 self.train_iter = iter(self.train_loader)
@@ -189,7 +189,7 @@ class CRESTTrainer(SubsetTrainer):
         if self.args.approx_moment:
             self.ggf = self.ggf_moment
 
-        if training_step == self.steps_per_epoch:
+        if training_step == 10:
             self.init_curvature_norm = gff_norm 
         else:
             self.args.check_interval = int(torch.ceil(self.init_curvature_norm / gff_norm * self.args.interval_mul))
@@ -203,7 +203,7 @@ class CRESTTrainer(SubsetTrainer):
                 'check_interval': self.args.check_interval,
                 'num_minibatch_coreset': self.args.num_minibatch_coreset})
 
-    def _check_approx_error(self, epoch:int, training_step: int) -> torch.Tensor:
+    def _check_approx_error(self, epoch:int, training_step: int) -> torch.Tensor:# TODO:auto update in fixed interval
         """
         Check the approximation error of the current batch
         :param epoch: current epoch

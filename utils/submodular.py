@@ -5,6 +5,7 @@ from submodlib.functions.facilityLocation import FacilityLocationFunction
 from submodlib.functions.disparitySum import DisparitySumFunction
 from submodlib.functions.disparityMin import DisparityMinFunction
 from submodlib.functions.setCover import SetCoverFunction
+from submodlib.functions.logDeterminant import LogDeterminantFunction
 
 
 def faciliy_location_order(
@@ -65,10 +66,13 @@ def normalize(scores):
         
 def rerank(vec,N):
     i=0
+    sum = 0
     rank = np.zeros(N)
     for elem in vec:
         rank[elem] = i
         i+=1
+        sum+=elem
+    rank[np.sum(np.arange(N))-sum] = 49
     return rank
         
 def facility_location_order_div_panel(
@@ -251,7 +255,7 @@ def faciliy_location_order_sim_panel(
 
     return class_indices[order], sz, greedy_time, S_time
 
-def faciliy_location_order_min(    #Apply the setcoverfunction
+def faciliy_location_order_det(    
     c, X, y, metric, num_per_class, weights=None, mode="sparse", num_n=128
 ):
     class_indices = np.where(y == c)[0]
@@ -262,24 +266,40 @@ def faciliy_location_order_min(    #Apply the setcoverfunction
         num_n = None
 
     start = time.time()
-    obj = DisparityMinFunction(
+    lambda_val = 1e-5
+    obj_cov = FacilityLocationFunction(
         n=len(X), mode=mode, data=X, metric=metric, num_neighbors=num_n
+    )
+    obj_det = LogDeterminantFunction(
+        n=len(X), mode=mode,lambdaVal= lambda_val,  data=X, metric=metric, num_neighbors=num_n
     )
     S_time = time.time() - start
 
     start = time.time()
-    greedyList = obj.maximize(
-        budget=num_per_class,
+    greedyList_det = obj_det.maximize(
+        budget=N-1,
         optimizer="LazyGreedy",
         stopIfZeroGain=False,
         stopIfNegativeGain=False,
         verbose=False,
     )
-    order = list(map(lambda x: x[0], greedyList))
-    sz = list(map(lambda x: x[1], greedyList)) #weight of sample
+    greedyList_cov = obj_cov.maximize(
+        budget=N-1,
+        optimizer="LazyGreedy",
+        stopIfZeroGain=False,
+        stopIfNegativeGain=False,
+        verbose=False,
+    )
+    order_det = list(map(lambda x: x[0], greedyList_det))
+    order_cov = list(map(lambda x: x[0], greedyList_cov))
     greedy_time = time.time() - start
+    cov_rank = rerank(order_cov,N)
+    det_rank = rerank(order_det,N)
+    rank = np.floor((cov_rank + det_rank)/2)
+    sort_indices = np.argsort(rank)
+    order = sort_indices[:num_per_class]
 
-    S = obj.sijs
+    S = obj_cov.sijs
     order = np.asarray(order, dtype=np.int64)
     sz = np.zeros(num_per_class, dtype=np.float64)
 
@@ -343,7 +363,7 @@ def get_orders_and_weights(
 
     order_mg_all, cluster_sizes_all, greedy_times, similarity_times = zip(
         *map(
-            lambda c: faciliy_location_order_min(
+            lambda c: faciliy_location_order_det(
                 c[1], X, y, metric, num_per_class[c[0]], weights, mode, num_n
             ),
             enumerate(classes),
