@@ -25,13 +25,13 @@ def get_args():
         help="number of total epochs to run")
     parser.add_argument("--resume_from_epoch", default=0, type=int,
         help="resume from a specific epoch")
-    parser.add_argument("--batch_size", default=64, type=int,
+    parser.add_argument("--batch_size", default=128, type=int,
         help="mini-batch size (default: 128)")
     parser.add_argument("--lr", default=0.1, type=float,help="initial learning rate")
     parser.add_argument("--momentum", "-m", type=float, default=0.9, help="momentum")
     parser.add_argument("--weight-decay", "--wd", default=1e-4, type=float,
         help="weight decay (default: 5e-4)")
-    parser.add_argument("--save-dir", default="./outputs/CREST_det_cov_rank", type=str,
+    parser.add_argument("--save-dir", default="./outputs/CREST_det_0.5", type=str,
         help="The directory used to save output")
     parser.add_argument("--save_freq", type=int, default=20,
         help="Saves checkpoints at every specified number of epochs")

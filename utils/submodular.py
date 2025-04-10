@@ -6,7 +6,7 @@ from submodlib.functions.disparitySum import DisparitySumFunction
 from submodlib.functions.disparityMin import DisparityMinFunction
 from submodlib.functions.setCover import SetCoverFunction
 from submodlib.functions.logDeterminant import LogDeterminantFunction
-
+from submodlib.functions.graphCut import GraphCutFunction
 
 def faciliy_location_order(
     c, X, y, metric, num_per_class, weights=None, mode="sparse", num_n=128
@@ -290,14 +290,28 @@ def faciliy_location_order_det(
         stopIfNegativeGain=False,
         verbose=False,
     )
+    alpha = 0.5
     order_det = list(map(lambda x: x[0], greedyList_det))
     order_cov = list(map(lambda x: x[0], greedyList_cov))
+    sz_det =  list(map(lambda x: x[1], greedyList_det))
+    sz_cov = list(map(lambda x: x[1], greedyList_cov))
     greedy_time = time.time() - start
-    cov_rank = rerank(order_cov,N)
-    det_rank = rerank(order_det,N)
-    rank = np.floor((cov_rank + det_rank)/2)
-    sort_indices = np.argsort(rank)
+    cov_scores = np.zeros(N)
+    det_scores = np.zeros(N)
+    for idx, score in zip(order_cov, sz_cov):
+        cov_scores[idx] = score
+    for idx, score in zip(order_det, sz_det):
+        det_scores[idx] = score
+    cov_norm = normalize(cov_scores)
+    div_norm = normalize(det_scores)
+    final_score = alpha*cov_norm + (1-alpha)*div_norm
+    sort_indices = np.argsort(final_score)[::-1]
     order = sort_indices[:num_per_class]
+   # cov_rank = rerank(order_cov,N)
+   #det_rank = rerank(order_det,N)
+    #rank = np.floor((cov_rank + det_rank)/2)
+   # sort_indices = np.argsort(rank)
+   # order = sort_indices[:num_per_class]
 
     S = obj_cov.sijs
     order = np.asarray(order, dtype=np.int64)
@@ -313,7 +327,47 @@ def faciliy_location_order_det(
     sz[np.where(sz == 0)] = 1
 
     return class_indices[order], sz, greedy_time, S_time
+def faciliy_location_order_graphcut(
+    c, X, y, metric, num_per_class, weights=None, mode="sparse", num_n=128
+):
+    class_indices = np.where(y == c)[0]
+    X = X[class_indices]
+    N = X.shape[0]
 
+    if mode == "dense":
+        num_n = None
+
+    start = time.time()
+    obj = GraphCutFunction(
+        n=len(X), mode=mode, data=X, lambdaVal=0.9,metric=metric, num_neighbors=num_n
+    )
+    S_time = time.time() - start
+
+    start = time.time()
+    greedyList = obj.maximize(
+        budget=num_per_class,
+        optimizer="LazyGreedy",
+        stopIfZeroGain=False,
+        stopIfNegativeGain=False,
+        verbose=False,
+    )
+    order = list(map(lambda x: x[0], greedyList))
+    sz = list(map(lambda x: x[1], greedyList)) #weight of sample
+    greedy_time = time.time() - start
+    S = obj.ggsijs
+    order = np.asarray(order, dtype=np.int64)
+    sz = np.zeros(num_per_class, dtype=np.float64)
+
+    for i in range(N):
+        if np.max(S[i, order]) <= 0:
+            continue
+        if weights is None:
+            sz[np.argmax(S[i, order])] += 1
+        else:
+            sz[np.argmax(S[i, order])] += weights[i]
+    sz[np.where(sz == 0)] = 1
+
+    return class_indices[order], sz, greedy_time, S_time
 def get_orders_and_weights(
     B,
     X,

@@ -39,7 +39,7 @@ class CRESTTrainer(SubsetTrainer):
         lr = self.lr_scheduler.get_last_lr()[0]
         self.args.logger.info(f"Epoch {epoch} LR {lr:.6f}")
 
-        for training_step in range(self.steps_per_epoch * epoch, self.steps_per_epoch * (epoch + 1)):
+        for training_step in range(self.steps_per_epoch * epoch, self.steps_per_epoch * (epoch + 1)):#steps_per_epoch = all data divide batchsize
 
             # if (training_step > self.reset_step) and ((training_step - self.reset_step) % self.args.check_interval == 0):
             #     self._check_approx_error(epoch, training_step)#4.1中误差计算,check_interval is T1
