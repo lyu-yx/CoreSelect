@@ -86,11 +86,13 @@ def get_args():
     parser.add_argument('--drop_interval', default=20, type=int, help='decide whether an example is learned based on how many epochs')
     parser.add_argument('--drop_thresh', default=0.1, type=float, help='loss threshold')
     parser.add_argument('--min_train_size', default=40000, type=int)
+    parser.add_argument('--generate_mixed_subset', default=True, type=bool, help='whether to generate a mixed subset')
 
     # detrimental example dropping
-    parser.add_argument('--drop_detrimental', default=False, type=parse_bool, const=True, nargs='?', help='drop detrimental examples')
+    parser.add_argument('--drop_detrimental', default=True, type=parse_bool, const=True, nargs='?', help='drop detrimental examples')
     parser.add_argument('--cluster_thresh', default=1, type=int, help='cluster size threshold')
-    parser.add_argument('--detrimental_sampled', default=128, type=int, help='number of points to select')
+    parser.add_argument('--detrimental_sampled', default=500, type=int, help='Specifies the maximum number of data points to sample for detrimental data processing.')
+    parser.add_argument('--target_drop_percentage', default='10', type=int, help='how many data points are dropped based on cluster weights.')
     parser.add_argument('--drop_after', default=0, type=int, help='epoch to start dropping detrimental examples')
     parser.add_argument('--optimizer', default="LazyGreedy", type=str, help='optimizer for detrimental instance dropping')
 
