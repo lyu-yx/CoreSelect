@@ -88,6 +88,7 @@ def get_args():
     parser.add_argument('--min_train_size', default=40000, type=int)
     parser.add_argument('--min_batch_size', default=400, type=int)
     parser.add_argument('--generate_mixed_subset', default=True, type=bool, help='whether to generate a mixed subset')
+    parser.add_argument('--dpp_weight', default=0.5, type=float, help='DPP weight')
 
     # detrimental example dropping
     parser.add_argument('--drop_detrimental', default=True, type=parse_bool, const=True, nargs='?', help='drop detrimental examples')

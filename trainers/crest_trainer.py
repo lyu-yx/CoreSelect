@@ -306,16 +306,23 @@ class CRESTTrainer(SubsetTrainer):
             
         N = len(indices)
         # Ensure we don't try to sample more than available
-        B = min(self.args.detrimental_sampled, N)
+        class_counts = np.bincount(self.train_target[indices])
+        min_class_count = np.min(class_counts[class_counts > 0])
+        B = min(self.args.detrimental_sampled, N, min_class_count * self.args.num_classes)
         
-        # Step 1: Initial clustering to group instances with similar gradient behavior
-        subset, subset_weights, _, _, cluster_ = get_coreset(
-            preds,
-            self.train_target[indices],
-            N,
-            B,
-            self.args.num_classes,
-        )
+        try:
+            # Step 1: Initial clustering to group instances with similar gradient behavior
+            subset, subset_weights, _, _, cluster_ = get_coreset(
+                preds,
+                self.train_target[indices],
+                N,
+                B,
+                self.args.num_classes,
+            )
+            # rest of processing
+        except Exception as e:
+            self.args.logger.warning(f"Error in coreset selection: {e}. Using original indices.")
+            return indices
         
         # Map the selected subset back to global indices, the subset number should be B
         subset = indices[subset]
@@ -573,7 +580,7 @@ class CRESTTrainer(SubsetTrainer):
                             gradients = preds  # Fall back to using softmax outputs if shape mismatch
                     
                     # Apply the joint objective F(S) = f(S) + λD(S)
-                    if hasattr(self.subset_generator, 'generate_mixed_subset') and self.args.use_joint_dpp:
+                    if hasattr(self.subset_generator, 'generate_mixed_subset'):
                         # Cache label and softmax data to avoid repeated access
                         local_labels = self.train_target[local_set]
                         local_softmax = self.train_softmax[local_set]
@@ -637,7 +644,7 @@ class CRESTTrainer(SubsetTrainer):
                 'epoch': epoch,
                 'training_step': training_step,
                 'final_subset_size': total_remaining,
-                'joint_dpp_applied': hasattr(self.subset_generator, 'generate_mixed_subset') and self.args.use_joint_dpp
+                'joint_dpp_applied': hasattr(self.subset_generator, 'generate_mixed_subset')
             })
 
 

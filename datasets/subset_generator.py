@@ -67,21 +67,104 @@ class SubsetGenerator:
             return indices, weights
             
         else:  # "mixed" or default - this is the joint objective approach
-            try:
-                # Use joint optimization if submodlib is available
-                indices, weights = self._joint_selection(features, labels, softmax_preds, subset_size, dpp_weight)
+            # Implement mixed logic directly to avoid issues with MixtureFunction
+            if not self.greedy:
+                # If not greedy, just return random samples with equal weights
+                indices = np.random.choice(len(features), subset_size, replace=False)
+                weights = np.ones(subset_size) / subset_size
                 return indices, weights
-            except ImportError:
-                # Fall back to sequential approach if submodlib isn't available
-                print("SubModLib's MixtureFunction not found. Using custom joint selection.")
+            
+            try:
+                # Try to import submodlib functions
+                from submodlib import FacilityLocationFunction, LogDeterminantFunction
                 
-                # Implement our own joint selection that properly balances diversity and coverage
-                # This is a custom implementation combining DPP and Facility Location principles
-                if not self.greedy:
-                    # If not greedy, just return random samples with equal weights
-                    indices = np.random.choice(len(features), subset_size, replace=False)
-                    weights = np.ones(subset_size) / subset_size
-                    return indices, weights
+                # Normalize features for kernel computation
+                X = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-8)
+                similarity_matrix = np.dot(X, X.T)
+                
+                # Coverage function: Facility Location (submodular)
+                fl_obj = FacilityLocationFunction(
+                    n=len(features),
+                    mode="dense",
+                    sijs=similarity_matrix,
+                    separate_rep=False
+                )
+                
+                # Diversity function: Log Determinant (DPP)
+                dpp_obj = LogDeterminantFunction(
+                    n=len(features),
+                    mode="dense",
+                    sijs=similarity_matrix,
+                    lambdaVal=1.0
+                )
+                
+                # Manual implementation of joint selection
+                selected_indices = []
+                remaining = list(range(len(features)))
+                
+                # Greedy selection
+                for i in range(min(subset_size, len(features))):
+                    if not remaining:
+                        break
+                        
+                    best_idx = -1
+                    best_gain = -float('inf')
+                    
+                    for idx in remaining:
+                        # Calculate marginal gain for each objective
+                        current_set = selected_indices.copy()
+                        
+                        # Calculate marginal gain for facility location (coverage)
+                        if current_set:
+                            # Convert list to set for evaluation
+                            fl_prev = fl_obj.evaluate(set(current_set))
+                            current_set.append(idx)
+                            fl_curr = fl_obj.evaluate(set(current_set))
+                            fl_gain = fl_curr - fl_prev
+                        else:
+                            current_set = [idx]
+                            fl_gain = fl_obj.evaluate(set(current_set))
+                        
+                        # Reset current set
+                        current_set = selected_indices.copy()
+                        
+                        # Calculate marginal gain for log determinant (diversity)
+                        if current_set:
+                            # Convert list to set for evaluation
+                            dpp_prev = dpp_obj.evaluate(set(current_set))
+                            current_set.append(idx)
+                            dpp_curr = dpp_obj.evaluate(set(current_set))
+                            dpp_gain = dpp_curr - dpp_prev
+                        else:
+                            current_set = [idx]
+                            dpp_gain = dpp_obj.evaluate(set(current_set))
+                        
+                        # Combined weighted gain
+                        gain = (1 - dpp_weight) * fl_gain + dpp_weight * dpp_gain
+                        
+                        if gain > best_gain:
+                            best_gain = gain
+                            best_idx = idx
+                    
+                    # Add the best element
+                    if best_idx != -1:
+                        selected_indices.append(best_idx)
+                        remaining.remove(best_idx)
+                
+                indices = np.array(selected_indices)
+                
+                # Calculate weights based on normalized similarity to other samples
+                if len(indices) > 0:
+                    row_sums = np.sum(similarity_matrix[indices, :], axis=1)
+                    weights = row_sums / np.sum(row_sums)  # Normalize to sum to 1
+                else:
+                    weights = np.array([], dtype=float)
+                
+                return indices, weights
+                
+            except ImportError:
+                # Fall back to basic implementation if submodlib isn't available
+                print("SubModLib not found. Using basic joint selection.")
                 
                 # Normalize features for kernel computation
                 X = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-8)
@@ -93,7 +176,7 @@ class SubsetGenerator:
                 selected_scores = []
                 
                 # Greedy joint selection - combining both coverage and diversity objectives
-                for i in range(min(size, len(features))):
+                for i in range(min(subset_size, len(features))):
                     if not remaining:
                         break
                     
@@ -102,11 +185,9 @@ class SubsetGenerator:
                     
                     for idx in remaining:
                         # COVERAGE TERM: How well this point represents the dataset
-                        # Higher similarity to many points = better coverage
                         coverage_score = np.sum(similarity_matrix[idx, :]) / len(features)
                         
                         # DIVERSITY TERM: How different this point is from already selected points
-                        # Lower similarity to selected = better diversity
                         diversity_score = 0
                         if selected:
                             sim_to_selected = np.mean(similarity_matrix[idx, selected])
@@ -191,7 +272,7 @@ class SubsetGenerator:
             n=len(features),
             mode="dense",
             sijs=similarity_matrix,
-            lambda_val=1.0  # Regularization parameter within log det
+            lambdaVal=1.0  # Regularization parameter within log det
         )
         
         # Create combined objective with weighted diversity
@@ -200,8 +281,7 @@ class SubsetGenerator:
         
         # Define the mixture with weights: (1-dpp_weight) for coverage, dpp_weight for diversity
         mixture_obj = MixtureFunction(
-            n=len(features),
-            functions=[fl_obj, dpp_obj],
+                        functions=[fl_obj, dpp_obj],
             weights=[(1-dpp_weight), dpp_weight]
         )
         
@@ -248,7 +328,7 @@ class SubsetGenerator:
                 n=len(features),
                 mode="dense",
                 sijs=similarity_matrix,
-                lambda_val=1.0  # Regularization parameter
+                lambdaVal=1.0  # Regularization parameter
             )
             
             # Perform greedy optimization
