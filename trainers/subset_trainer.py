@@ -104,37 +104,17 @@ class SubsetTrainer(BaseTrainer):
 
     def _select_subset(self, epoch: int, training_step: int):
         """
-        Select a subset of the data using a combination of DPPs and submodular methods
-        for better coverage and diversity.
+        Select a subset of the data
         """
         self.num_selection += 1
 
         if self.args.use_wandb:
             wandb.log({"epoch": epoch, "training_step": training_step, "num_selection": self.num_selection})
-            
-        # Get the model's current predictions on training data
-        self._get_train_output()
-        
-        # Calculate subset size based on args
-        subset_size = int(len(self.train_dataset) * self.args.subset_ratio) if hasattr(self.args, 'subset_ratio') else len(self.train_dataset) // 10
-        
-        # Generate subset using both DPPs and submodular methods
-        # This provides both diversity (from DPPs) and representative coverage (from submodular selection)
-        self.subset, self.subset_weights = self.subset_generator.generate_mixed_subset(
-            features=self.train_output,  # Model embeddings/outputs
-            labels=self.train_target,    # True labels
-            softmax_preds=self.train_softmax,  # Prediction probabilities
-            subset_size=subset_size,
-            dpp_weight=self.args.dpp_weight if hasattr(self.args, 'dpp_weight') else 0.5,
-            submod_weight=self.args.submod_weight if hasattr(self.args, 'submod_weight') else 0.5,
-            selection_method=self.args.selection_method
-        )
-        
-        self.args.logger.info(f"Selected {len(self.subset)} samples for training")
-        
+
         if self.args.cache_dataset:
             self.train_dataset.clean()
             self.train_dataset.cache()
+        pass
 
     def _get_num_selection(self):
         return self.num_selection

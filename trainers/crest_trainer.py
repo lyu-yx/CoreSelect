@@ -293,8 +293,7 @@ class CRESTTrainer(SubsetTrainer):
 
     def _drop_detrimental_data(self, epoch: int, training_step: int, indices: np.ndarray, preds):
         """
-        Drop the detrimental data points using a combination of clustering and DPP-based 
-        joint objective to ensure both high quality (non-detrimental) and diverse data.
+        Drop the detrimental data points using clustering-based filtering.
         
         :param epoch: current epoch
         :param training_step: current training step
@@ -346,7 +345,7 @@ class CRESTTrainer(SubsetTrainer):
             
         # Only apply filtering after certain epoch
         if epoch >= self.args.drop_after:
-            # Step 2: Keep only data points that belong to the selected clusters
+            # Keep only data points that belong to the selected clusters
             keep_mask = np.isin(cluster, valid_clusters)
             keep_indices = np.where(keep_mask)[0]
             
@@ -357,39 +356,6 @@ class CRESTTrainer(SubsetTrainer):
                     f"Using original indices instead."
                 )
                 keep_indices = indices
-                
-            # Step 3: Apply DPP-based joint objective to the non-detrimental points
-            # This ensures we keep a diverse and representative subset
-            if hasattr(self.subset_generator, 'generate_mixed_subset') and len(keep_indices) > self.args.min_batch_size:
-                try:
-                    # Get features/softmax predictions for the non-detrimental points
-                    filtered_preds = self.train_softmax[keep_indices]
-                    features = self.train_output[keep_indices] if hasattr(self, 'train_output') else filtered_preds
-                    
-                    # Determine target size (keep a significant portion of non-detrimental data)
-                    target_size = min(len(keep_indices), 
-                                     max(self.args.min_batch_size, 
-                                         int(len(keep_indices) * self.args.diversity_keep_ratio)))
-                    
-                    # Apply joint DPP+coverage selection to ensure diversity
-                    selected_indices, _ = self.subset_generator.generate_mixed_subset(
-                        features=features,
-                        labels=self.train_target[keep_indices],
-                        softmax_preds=filtered_preds,
-                        subset_size=target_size,
-                        dpp_weight=self.args.dpp_weight,
-                        submod_weight=1.0 - self.args.dpp_weight,
-                        selection_method="submod"  # Use joint objective
-                    )
-                    
-                    # Map back to original indices
-                    keep_indices = keep_indices[selected_indices]
-                    
-                    self.args.logger.info(
-                        f"Applied joint DPP+coverage selection: {len(keep_indices)} out of {len(selected_indices)} points kept"
-                    )
-                except Exception as e:
-                    self.args.logger.warning(f"Error in joint selection: {e}. Using cluster selection only.")
         else:
             keep_indices = indices
     
@@ -408,8 +374,7 @@ class CRESTTrainer(SubsetTrainer):
                 'epoch': epoch,
                 'training_step': training_step,
                 'detrimental_drop_count': len(updated_indices),
-                'detrimental_drop_percentage': drop_percentage,
-                'joint_dpp_applied': epoch >= self.args.drop_after
+                'detrimental_drop_percentage': drop_percentage
             }
             
             if len(subset_weights) > 0:
@@ -505,9 +470,7 @@ class CRESTTrainer(SubsetTrainer):
         1. Gradient-based filtering to remove detrimental points
         2. Joint objective F(S) = f(S) + λD(S) for final selection
         """
-        # Call the superclass method if needed.
-        super()._select_subset(epoch, training_step)
-        
+
         # ----------------------------
         # 1. Select random subsets
         # ----------------------------
@@ -515,6 +478,19 @@ class CRESTTrainer(SubsetTrainer):
         self.subset = []
         self.subset_weights = []
         
+        # Track selection for metrics (originally done in parent method)
+        self.num_selection += 1
+        
+        # Log selection event to wandb (originally done in parent method)
+        if self.args.use_wandb:
+            wandb.log({"epoch": epoch, "training_step": training_step, "num_selection": self.num_selection})
+            
+        # Handle dataset caching if needed (originally done in parent method)
+        if self.args.cache_dataset:
+            self.train_dataset.clean()
+            self.train_dataset.cache()
+            
+        # Continue with the existing implementation
         for _ in range(self.args.num_minibatch_coreset):
             # Select a random subset of global indices.
             random_subset = self._select_random_set()
@@ -579,33 +555,38 @@ class CRESTTrainer(SubsetTrainer):
                     preds = self.train_softmax[local_set]
                     print(f"Epoch [{epoch}] [Greedy], after detrimental drop: {len(local_set)}/{original_size} points remain")
                 
-                # Calculate gradient approximation for the joint objective
-                if np.shape(preds)[-1] == self.args.num_classes:
-                    one_hot_labels = np.eye(self.args.num_classes)[self.train_target[local_set]]
-                    
-                    # Compute gradients as in CREST: g = softmax(logits) - one_hot(true_labels)
-                    if one_hot_labels.shape == preds.shape:
-                        # This calculates the gradient of the cross-entropy loss with respect to the logits
-                        gradients = preds - one_hot_labels
-                    else:
-                        self.args.logger.error(
-                            f"Shape mismatch: preds {preds.shape} vs one_hot {one_hot_labels.shape}. "
-                            f"Skipping gradient calculation."
-                        )
-                        gradients = preds  # Fall back to using softmax outputs if shape mismatch
-                
                 # Skip subset generation if local_set is empty
                 if len(local_set) > 0:
-                    # Here's where we apply the joint objective F(S) = f(S) + λD(S)
+                    # Calculate gradient approximation for the joint objective
+                    if np.shape(preds)[-1] == self.args.num_classes:
+                        one_hot_labels = np.eye(self.args.num_classes)[self.train_target[local_set]]
+                        
+                        # Compute gradients as in CREST: g = softmax(logits) - one_hot(true_labels)
+                        if one_hot_labels.shape == preds.shape:
+                            # This calculates the gradient of the cross-entropy loss with respect to the logits
+                            gradients = preds - one_hot_labels
+                        else:
+                            self.args.logger.error(
+                                f"Shape mismatch: preds {preds.shape} vs one_hot {one_hot_labels.shape}. "
+                                f"Skipping gradient calculation."
+                            )
+                            gradients = preds  # Fall back to using softmax outputs if shape mismatch
+                    
+                    # Apply the joint objective F(S) = f(S) + λD(S)
                     if hasattr(self.subset_generator, 'generate_mixed_subset') and self.args.use_joint_dpp:
-                        # Explicitly use gradients as features for maximum theoretical alignment
-                        features = self.train_output[local_set] if hasattr(self, 'train_output') else gradients
+                        # Cache label and softmax data to avoid repeated access
+                        local_labels = self.train_target[local_set]
+                        local_softmax = self.train_softmax[local_set]
+                        
+                        # Features should be the computed gradients for theoretical alignment
+                        # Note: We reuse the gradients already computed above rather than recalculating
+                        features = gradients
                         
                         # This explicitly optimizes the joint objective from the theory
                         subset_indices, weights = self.subset_generator.generate_mixed_subset(
                             features=features,  # Gradient features for diversity kernel
-                            labels=self.train_target[local_set],
-                            softmax_preds=self.train_softmax[local_set],
+                            labels=local_labels,
+                            softmax_preds=local_softmax,
                             subset_size=min(self.args.batch_size, len(local_set)),
                             dpp_weight=self.args.dpp_weight,  # This is λ in F(S) = f(S) + λD(S)
                             submod_weight=1.0 - self.args.dpp_weight,
@@ -617,26 +598,15 @@ class CRESTTrainer(SubsetTrainer):
                         self.args.logger.info(f"Using joint DPP+coverage selection: {len(subset)} points selected")
                         similarity_time = 0  # Not measured for this path
                     else:
-                        # Fall back to legacy selection method - still implicitly optimizes
-                        # a coverage objective but without explicit diversity term
-                        subset_indices, weights = self.subset_generator.generate_mixed_subset(
-                            features=features,  # Gradient features for diversity kernel
-                            labels=self.train_target[local_set],
-                            softmax_preds=self.train_softmax[local_set],
-                            subset_size=min(self.args.batch_size, len(local_set)),
-                            dpp_weight=self.args.dpp_weight,  # This is λ in F(S) = f(S) + λD(S)
-                            submod_weight=1.0 - self.args.dpp_weight,
-                            selection_method="submod"
+                        # Fall back to legacy selection method
+                        subset, weights, _, similarity_time = self.subset_generator.generate_subset(
+                            preds=gradients,  # Use computed gradients instead of preds
+                            epoch=epoch,
+                            B=min(self.args.batch_size, len(local_set)),  # Don't request more than available
+                            idx=local_set,
+                            targets=self.train_target,
+                            use_submodlib=(self.args.smtk == 0),
                         )
-                        
-                        # subset, weights, _, similarity_time = self.subset_generator.generate_subset(
-                        #     preds=gradients,  # Use computed gradients instead of preds
-                        #     epoch=epoch,
-                        #     B=min(self.args.batch_size, len(local_set)),  # Don't request more than available
-                        #     idx=local_set,
-                        #     targets=self.train_target,
-                        #     use_submodlib=(self.args.smtk == 0),
-                        # )
                     
                     self.similarity_time.update(similarity_time)
                     processed_subsets.append(subset)
@@ -666,9 +636,8 @@ class CRESTTrainer(SubsetTrainer):
             wandb.log({
                 'epoch': epoch,
                 'training_step': training_step,
-                'detrimental_drop_count': len(self.subset),
-                'detrimental_drop_percentage': 100 * (1 - len(self.subset) / (len(combined_random_sets) or 1)),  # Avoid division by zero
-                'joint_dpp_applied': epoch >= self.args.drop_after
+                'final_subset_size': total_remaining,
+                'joint_dpp_applied': hasattr(self.subset_generator, 'generate_mixed_subset') and self.args.use_joint_dpp
             })
 
 

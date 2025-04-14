@@ -86,6 +86,7 @@ def get_args():
     parser.add_argument('--drop_interval', default=20, type=int, help='decide whether an example is learned based on how many epochs')
     parser.add_argument('--drop_thresh', default=0.1, type=float, help='loss threshold')
     parser.add_argument('--min_train_size', default=40000, type=int)
+    parser.add_argument('--min_batch_size', default=400, type=int)
     parser.add_argument('--generate_mixed_subset', default=True, type=bool, help='whether to generate a mixed subset')
 
     # detrimental example dropping
