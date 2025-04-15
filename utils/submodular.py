@@ -7,6 +7,8 @@ from submodlib.functions.disparityMin import DisparityMinFunction
 from submodlib.functions.setCover import SetCoverFunction
 from submodlib.functions.logDeterminant import LogDeterminantFunction
 from submodlib.functions.graphCut import GraphCutFunction
+from sklearn.decomposition import PCA
+from sklearn.metrics.pairwise import cosine_similarity
 
 def faciliy_location_order(
     c, X, y, metric, num_per_class, weights=None, mode="sparse", num_n=128
@@ -50,7 +52,65 @@ def faciliy_location_order(
     sz[np.where(sz == 0)] = 1
 
     return class_indices[order], sz, greedy_time, S_time
+def facility_location_order_dpp(c, X, y, metric, num_per_class, weights=None, mode="sparse", num_n=128):
+    class_indices = np.where(y == c)[0]
+    X = X[class_indices]
+    N = X.shape[0]
 
+    if mode == "dense":
+        num_n = None
+    start = time.time()
+    obj = FacilityLocationFunction(
+        n=len(X), mode=mode, data=X, metric=metric, num_neighbors=num_n
+    )
+    lambda_reg = 1e-5
+    pca = PCA(n_components=0.95)
+    pca.fit(X)
+    projected = pca.transform(X)          # 投影到主成分空间
+    energy = np.sum(projected**2,axis=1)    # 每个样本的投影能量
+    pca_candidates = np.argsort(-energy)[:int(1.5*num_per_class)]
+    candidate_features = projected[pca_candidates]
+    
+    # 构建多样性核矩阵
+    K = cosine_similarity(candidate_features)
+    K += lambda_reg * np.eye(K.shape[0])
+    
+    # 贪心行列式最大化
+    selected = []
+    remaining = list(range(len(pca_candidates)))
+    
+    for _ in range(num_per_class):
+        max_score = -np.inf
+        best_idx = -1
+        for idx in remaining:
+            current_subset = selected + [idx]
+            sub_K = K[np.ix_(current_subset, current_subset)]
+            score = np.log(np.linalg.det(sub_K))
+            if score > max_score:
+                max_score = score
+                best_idx = idx
+        selected.append(best_idx)
+        remaining.remove(best_idx)
+    
+    # 映射回原始索引
+    core_indices = pca_candidates[selected]
+    greedy_time = time.time() - start
+    S_time = time.time() - start
+    order = np.asarray(core_indices, dtype=np.int64)
+    S = obj.sijs
+    order = np.asarray(order, dtype=np.int64)
+    sz = np.zeros(num_per_class, dtype=np.float64)
+
+    for i in range(N):
+        if np.max(S[i, order]) <= 0:
+            continue
+        if weights is None:
+            sz[np.argmax(S[i, order])] += 1
+        else:
+            sz[np.argmax(S[i, order])] += weights[i]
+    sz[np.where(sz == 0)] = 1
+
+    return order,sz,greedy_time,S_time
 def normalize(scores):
     if(np.max(scores)/sum(scores) >= 0.5):
         max_idx = np.argmax(scores)
@@ -417,7 +477,7 @@ def get_orders_and_weights(
 
     order_mg_all, cluster_sizes_all, greedy_times, similarity_times = zip(
         *map(
-            lambda c: faciliy_location_order_det(
+            lambda c: facility_location_order_dpp(
                 c[1], X, y, metric, num_per_class[c[0]], weights, mode, num_n
             ),
             enumerate(classes),

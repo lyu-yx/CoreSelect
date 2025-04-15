@@ -30,9 +30,8 @@ def pca_based_coreset_selection(gradients, m, features=None, n_components=0.95, 
     
     # 阶段2: DPP多样性筛选
     # 准备特征矩阵（优先使用外部特征，否则用降维后的梯度）
-    if features is None:
-        features = pca.transform(gradients)      # 使用PCA降维后的梯度作为特征
-    candidate_features = features[pca_candidates]
+    # 使用PCA降维后的梯度作为特征
+    candidate_features = projected[pca_candidates]
     
     # 构建多样性核矩阵
     K = cosine_similarity(candidate_features)
@@ -62,7 +61,7 @@ def pca_based_coreset_selection(gradients, m, features=None, n_components=0.95, 
 # 示例用法
 if __name__ == "__main__":
     # 生成模拟数据：100样本，梯度维度1000
-    np.random.seed(42)
+    np.random.seed(27)
     n_samples = 100
     grad_dim = 1000
     features_dim = 50  # 假设外部特征维度
