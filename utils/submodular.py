@@ -10,7 +10,7 @@ from submodlib.functions.graphCut import GraphCutFunction
 from sklearn.decomposition import PCA
 from sklearn.metrics.pairwise import cosine_similarity
 
-def faciliy_location_order(
+def facility_location_order(
     c, X, y, metric, num_per_class, weights=None, mode="sparse", num_n=128
 ):
     class_indices = np.where(y == c)[0]
@@ -63,13 +63,21 @@ def facility_location_order_dpp(c, X, y, metric, num_per_class, weights=None, mo
     obj = FacilityLocationFunction(
         n=len(X), mode=mode, data=X, metric=metric, num_neighbors=num_n
     )
+    greedyList = obj.maximize(
+        budget=num_per_class,
+        optimizer="LazyGreedy",
+        stopIfZeroGain=False,
+        stopIfNegativeGain=False,
+        verbose=False,
+    )
+    order_cov = list(map(lambda x: x[0], greedyList))
     lambda_reg = 1e-5
     pca = PCA(n_components=0.95)
     pca.fit(X)
     projected = pca.transform(X)          # 投影到主成分空间
     energy = np.sum(projected**2,axis=1)    # 每个样本的投影能量
     pca_candidates = np.argsort(-energy)[:int(1.5*num_per_class)]
-    candidate_features = projected[pca_candidates]
+    candidate_features = X[pca_candidates]
     
     # 构建多样性核矩阵
     K = cosine_similarity(candidate_features)
@@ -110,7 +118,7 @@ def facility_location_order_dpp(c, X, y, metric, num_per_class, weights=None, mo
             sz[np.argmax(S[i, order])] += weights[i]
     sz[np.where(sz == 0)] = 1
 
-    return order,sz,greedy_time,S_time
+    return class_indices[order],sz,greedy_time,S_time
 def normalize(scores):
     if(np.max(scores)/sum(scores) >= 0.5):
         max_idx = np.argmax(scores)
