@@ -1,6 +1,7 @@
 from utils import Adahessian
 from datasets.subset import get_coreset
 from .subset_trainer import *
+from time import time
 
 
 class CRESTTrainer(SubsetTrainer):
@@ -459,7 +460,6 @@ class CRESTTrainer(SubsetTrainer):
                     targets=self.train_target,
                     use_submodlib=(self.args.smtk==0),
                 )
-                
                 self.similarity_time.update(similarity_time)
                 self.subset.append(subset)
                 self.subset_weights.append(weight)
@@ -511,7 +511,10 @@ class CRESTTrainer(SubsetTrainer):
         # ----------------------------
         if self.args.drop_learned:
             # This updates self.train_indices based on loss values.
+            time_start = time.time()
             self._drop_learned_data(epoch, training_step, combined_random_sets)
+            time_end = time.time()
+            self.args.logger.info(f"dropping learned data: {time_end - time_start:.2f} seconds")
             
         # Filter each random set so they contain only indices in self.train_indices.
         self.random_sets = [np.intersect1d(rs, self.train_indices) for rs in self.random_sets]
@@ -524,9 +527,12 @@ class CRESTTrainer(SubsetTrainer):
             num_workers=self.args.num_workers,
             pin_memory=True,
         )
-        
+
+
+        time_start = time.time()
         self._get_train_output()  # Update all random_set gradient.
-        
+        time_end = time.time()
+        self.args.logger.info(f"_get_train_output: {time_end - time_start:.2f} seconds")
         # ----------------------------
         # 3. Process each random subset individually
         # ----------------------------
@@ -549,7 +555,6 @@ class CRESTTrainer(SubsetTrainer):
                     original_size = len(local_set)
                     # This is where we identify and remove points that hurt training
                     local_set = self._drop_detrimental_data(epoch, training_step, local_set, preds)
-                    
                     # Safety check - if we dropped all points,
                     # revert to original set
                     if len(local_set) == 0:
@@ -589,6 +594,8 @@ class CRESTTrainer(SubsetTrainer):
                         # Note: We reuse the gradients already computed above rather than recalculating
                         features = gradients
                         
+                        
+                        time_start = time.time()
                         # This explicitly optimizes the joint objective from the theory
                         subset_indices, weights = self.subset_generator.generate_mixed_subset(
                             features=features,  # Gradient features for diversity kernel
@@ -599,7 +606,8 @@ class CRESTTrainer(SubsetTrainer):
                             submod_weight=1.0 - self.args.dpp_weight,
                             selection_method="mixed"
                         )
-                        
+                        time_end = time.time()
+                        self.args.logger.info(f"generate_mixed_subset: {time_end - time_start:.2f} seconds")
                         # Map to global indices
                         subset = local_set[subset_indices]
                         self.args.logger.info(f"Using joint DPP+coverage selection: {len(subset)} points selected")

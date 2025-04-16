@@ -176,11 +176,6 @@ def get_orders_and_weights(
     - weights_mg/_sz: np.array, shape [B], type float32, sums to 1
     """
 
-    # print("in normal")
-    # print('B', B)
-    # print('X', X)
-    # print('metric', metric)
-    # print('y', y)
     N = X.shape[0]
     if y is None:
         y = np.zeros(N, dtype=np.int32)  # assign every point to the same class

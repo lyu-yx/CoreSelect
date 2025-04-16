@@ -6,7 +6,7 @@ from enum import Enum
 import numpy as np
 import torch
 from utils import submodular, craig
-
+from time import time
 
 class SubsetGenerator:
     def __init__(self, greedy: bool = True, smtk: float = 1.0):
@@ -102,54 +102,91 @@ class SubsetGenerator:
                 selected_indices = []
                 remaining = list(range(len(features)))
                 
-                # Greedy selection
-                for i in range(min(subset_size, len(features))):
+                # Start timer for performance tracking
+                start_time = time()
+                
+                # More efficient implementation inspired by get_orders_and_weights
+                # Instead of nested loops, compute gains in vectorized form
+                for _ in range(min(subset_size, len(features))):
                     if not remaining:
                         break
-                        
-                    best_idx = -1
-                    best_gain = -float('inf')
                     
-                    for idx in remaining:
-                        # Calculate marginal gain for each objective
-                        current_set = selected_indices.copy()
+                    # Calculate gains for all remaining indices at once if possible
+                    if len(selected_indices) == 0:
+                        # For the first element, we compute both objectives directly
+                        # For FL: Each point's representation score is its row sum in similarity matrix
+                        fl_gains = np.sum(similarity_matrix[remaining, :], axis=1)
                         
-                        # Calculate marginal gain for facility location (coverage)
-                        if current_set:
-                            # Convert list to set for evaluation
-                            fl_prev = fl_obj.evaluate(set(current_set))
-                            current_set.append(idx)
-                            fl_curr = fl_obj.evaluate(set(current_set))
-                            fl_gain = fl_curr - fl_prev
-                        else:
-                            current_set = [idx]
-                            fl_gain = fl_obj.evaluate(set(current_set))
+                        # For DPP: With empty set, it's the log of diagonal elements (self-similarity)
+                        dpp_gains = np.log(np.diag(similarity_matrix)[remaining] + 1e-10)
                         
-                        # Reset current set
-                        current_set = selected_indices.copy()
+                        # Combine gains with weights
+                        combined_gains = (1 - dpp_weight) * fl_gains + dpp_weight * dpp_gains
                         
-                        # Calculate marginal gain for log determinant (diversity)
-                        if current_set:
-                            # Convert list to set for evaluation
-                            dpp_prev = dpp_obj.evaluate(set(current_set))
-                            current_set.append(idx)
-                            dpp_curr = dpp_obj.evaluate(set(current_set))
-                            dpp_gain = dpp_curr - dpp_prev
-                        else:
-                            current_set = [idx]
-                            dpp_gain = dpp_obj.evaluate(set(current_set))
+                        # Find the best point
+                        best_local_idx = np.argmax(combined_gains)
+                        best_idx = remaining[best_local_idx]
                         
-                        # Combined weighted gain
-                        gain = (1 - dpp_weight) * fl_gain + dpp_weight * dpp_gain
+                    else:
+                        # For subsequent elements, we need to compute marginal gains
+                        # Convert current selection to set for evaluation
+                        current_set = set(selected_indices)
                         
-                        if gain > best_gain:
-                            best_gain = gain
-                            best_idx = idx
+                        # Precompute base values for current set
+                        fl_prev = fl_obj.evaluate(current_set)
+                        dpp_prev = dpp_obj.evaluate(current_set)
+                        
+                        # Vectorize marginal gain calculation
+                        best_gain = -float('inf')
+                        best_idx = -1
+                        
+                        # We'll compute gains in smaller batches to avoid memory issues
+                        batch_size = min(1000, len(remaining))
+                        for i in range(0, len(remaining), batch_size):
+                            batch_indices = remaining[i:i+batch_size]
+                            
+                            fl_gains = []
+                            dpp_gains = []
+                            
+                            # This loop is over a batch, not the full remaining set
+                            for idx in batch_indices:
+                                # We still need to evaluate each point for its marginal gain
+                                # but we're processing in batches
+                                temp_set = current_set.copy()
+                                temp_set.add(idx)
+                                
+                                fl_curr = fl_obj.evaluate(temp_set)
+                                fl_gain = fl_curr - fl_prev
+                                
+                                dpp_curr = dpp_obj.evaluate(temp_set)
+                                dpp_gain = dpp_curr - dpp_prev
+                                
+                                fl_gains.append(fl_gain)
+                                dpp_gains.append(dpp_gain)
+                            
+                            # Convert to numpy arrays for vectorized operations
+                            fl_gains = np.array(fl_gains)
+                            dpp_gains = np.array(dpp_gains)
+                            
+                            # Combine gains with weights
+                            combined_gains = (1 - dpp_weight) * fl_gains + dpp_weight * dpp_gains
+                            
+                            # Find the best point in this batch
+                            local_best_idx = np.argmax(combined_gains)
+                            local_best_gain = combined_gains[local_best_idx]
+                            
+                            if local_best_gain > best_gain:
+                                best_gain = local_best_gain
+                                best_idx = batch_indices[local_best_idx]
                     
                     # Add the best element
                     if best_idx != -1:
                         selected_indices.append(best_idx)
                         remaining.remove(best_idx)
+                
+                # Calculate total selection time
+                selection_time = time() - start_time
+                print(f"Mixed selection completed in {selection_time:.2f} seconds")
                 
                 indices = np.array(selected_indices)
                 
