@@ -82,17 +82,47 @@ class SubsetTrainer(BaseTrainer):
             self.train_dataset.clean()
             self._update_train_loader_and_weights()
 
-    def _get_train_output(self):
+    def _get_train_output(self, indices=None):
         """
-        Evaluate the model on the training set and record the output and softmax
+        Evaluate the model on the training set (or subset) and record the output and softmax
+        
+        Args:
+            indices: If provided, only compute outputs for these indices.
+                    Otherwise compute for the entire dataset.
         """
         self.model.eval()
 
-        self.train_output = np.zeros((len(self.train_dataset), self.args.num_classes))
-        self.train_softmax = np.zeros((len(self.train_dataset), self.args.num_classes))
+        if indices is None:
+            # Initialize arrays for the entire dataset
+            if not hasattr(self, 'train_output') or self.train_output.shape[0] != len(self.train_dataset):
+                self.train_output = np.zeros((len(self.train_dataset), self.args.num_classes))
+                self.train_softmax = np.zeros((len(self.train_dataset), self.args.num_classes))
+                
+            # Evaluate on all data points via train_val_loader
+            loader = DataLoader(
+                self.train_dataset,
+                batch_size=self.args.batch_size,
+                shuffle=False,
+                num_workers=self.args.num_workers,
+                pin_memory=True
+            )
+        else:
+            # Initialize arrays if they don't exist
+            if not hasattr(self, 'train_output'):
+                self.train_output = np.zeros((len(self.train_dataset), self.args.num_classes))
+                self.train_softmax = np.zeros((len(self.train_dataset), self.args.num_classes))
+                
+            # Evaluate only on the specified indices
+            loader = DataLoader(
+                Subset(self.train_dataset, indices),
+                batch_size=self.args.batch_size,
+                shuffle=False,
+                num_workers=self.args.num_workers,
+                pin_memory=True
+            )
 
         with torch.no_grad():
-            for _, (data, _, data_idx) in enumerate(self.train_val_loader):
+            for _, (data, _, data_idx) in enumerate(loader):
                 data = data.to(self.args.device)
 
                 output = self.model(data)
@@ -101,6 +131,7 @@ class SubsetTrainer(BaseTrainer):
                 self.train_softmax[data_idx] = output.softmax(dim=1).cpu().numpy()
 
         self.model.train()
+
 
     def _select_subset(self, epoch: int, training_step: int):
         """

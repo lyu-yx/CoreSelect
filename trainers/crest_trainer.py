@@ -294,7 +294,7 @@ class CRESTTrainer(SubsetTrainer):
 
     def _drop_detrimental_data(self, epoch: int, training_step: int, indices: np.ndarray, preds):
         """
-        Drop the detrimental data points using clustering-based filtering.
+        Drop the detrimental data points using EPIC-style filtering.
         
         :param epoch: current epoch
         :param training_step: current training step
@@ -302,60 +302,72 @@ class CRESTTrainer(SubsetTrainer):
         :param preds: predictions corresponding to those indices
         :return: updated indices after dropping detrimental data.
         """
-        if len(indices) == 0:
+        if len(indices) == 0 or epoch < self.args.drop_after:
             return indices
+            
+        # Only drop on specific epochs based on frequency setting
+        if not ((epoch % self.args.drop_interval == 0) and epoch >= self.args.drop_after):
+            return indices
+            
+        # Initialize times_selected if not already present
+        if not hasattr(self, 'times_selected'):
+            self.times_selected = torch.zeros(len(self.train_dataset))
+            
+        # Update selection counts for current indices
+        self.times_selected[indices] += 1
             
         N = len(indices)
         # Ensure we don't try to sample more than available
         class_counts = np.bincount(self.train_target[indices])
         min_class_count = np.min(class_counts[class_counts > 0])
-        B = min(self.args.detrimental_sampled, N, min_class_count * self.args.num_classes)
+        B = min(self.args.detrimental_cluster_num, N)
+        
+        self.args.logger.info(f'Identifying small clusters at epoch {epoch}...')
         
         try:
-            # Step 1: Initial clustering to group instances with similar gradient behavior
-            subset, subset_weights, _, _, cluster_ = get_coreset(
+            # Step 1: Get coreset with clustering information
+            subset, subset_weights, ordering_time, similarity_time, cluster = get_coreset(
                 preds,
                 self.train_target[indices],
                 N,
                 B,
                 self.args.num_classes,
+                equal_num=True,
+                optimizer=self.args.optimizer,
             )
-            # rest of processing
-        except Exception as e:
-            self.args.logger.warning(f"Error in coreset selection: {e}. Using original indices.")
-            return indices
-        
-        # Map the selected subset back to global indices, the subset number should be B
-        subset = indices[subset]
-        
-        # Create a cluster mapping for the full dataset
-        cluster = -np.ones(len(self.train_target), dtype=int)
-        cluster[indices] = cluster_
-        
-        # Identify clusters to keep based on the weight threshold
-        # Dynamic threshold based on desired drop percentage
-        if hasattr(self.args, 'target_drop_percentage'):
-            # Sort weights and find threshold that gives target percentage
-            sorted_weights = np.sort(subset_weights)
-            target_idx = int(len(sorted_weights) * (1 - self.args.target_drop_percentage/100))
-            target_idx = max(0, min(target_idx, len(sorted_weights)-1))  # Ensure valid index
-            dynamic_threshold = sorted_weights[target_idx]
             
-            # Use the dynamic threshold, but don't go below the minimum threshold
-            actual_threshold = max(dynamic_threshold, self.args.cluster_thresh)
-            valid_clusters = np.where(subset_weights > actual_threshold)[0]
+            # Map the selected subset back to global indices 
+            subset = indices[subset]
             
-            self.args.logger.info(f"Using dynamic threshold: {actual_threshold:.4f} "
-                                 f"(target: {self.args.target_drop_percentage}%)")
-        else:
-            # Use fixed threshold as before
-            valid_clusters = np.where(subset_weights > self.args.cluster_thresh)[0]
+            # Create a cluster mapping for the full dataset
+            cluster_map = -np.ones(len(self.train_target), dtype=int)
+            cluster_map[indices] = cluster
             
-        # Only apply filtering after certain epoch
-        if epoch >= self.args.drop_after:
-            # Keep only data points that belong to the selected clusters
-            keep_mask = np.isin(cluster, valid_clusters)
-            keep_indices = np.where(keep_mask)[0]
+            # Calculate cluster sizes and identify small clusters
+            cluster_sizes = {}
+            for c in range(np.max(cluster) + 1):
+                cluster_sizes[c] = np.sum(cluster == c)
+                
+            # Get threshold based on percentile of cluster sizes
+            cluster_size_values = np.array(list(cluster_sizes.values()))
+            threshold = np.percentile(cluster_size_values, self.args.cluster_thresh)
+            
+            # Identify the small clusters to be dropped
+            small_clusters = [c for c, size in cluster_sizes.items() if size <= threshold]
+            
+            self.args.logger.info(f"Found {len(small_clusters)} small clusters out of {np.max(cluster) + 1} total clusters")
+            self.args.logger.info(f"Cluster size threshold: {threshold}")
+            
+            # Keep only points that are NOT in small clusters
+            keep_mask = ~np.isin(cluster, small_clusters)
+            keep_indices = indices[keep_mask]
+            
+            # EPIC specific: Keep only instances that match the epoch count
+            # This prevents selecting the same instance multiple times
+            if hasattr(self, 'times_selected'):
+                # Follow EPIC's approach: keep = np.where(times_selected[subset] == epoch)[0]
+                match_epoch = np.where(self.times_selected[keep_indices].cpu().numpy() == epoch)[0]
+                keep_indices = keep_indices[match_epoch]
             
             # Safety check: ensure we're not dropping too many points
             if len(keep_indices) < self.args.min_batch_size:
@@ -364,40 +376,31 @@ class CRESTTrainer(SubsetTrainer):
                     f"Using original indices instead."
                 )
                 keep_indices = indices
-        else:
+                
+        except Exception as e:
+            self.args.logger.warning(f"Error in coreset selection: {e}. Using original indices.")
             keep_indices = indices
-    
-        # Ensure we only return valid points that were in the original indices
-        updated_indices = np.intersect1d(indices, keep_indices)
         
-        drop_percentage = 100 * (1 - len(updated_indices) / len(indices))
+        drop_percentage = 100 * (1 - len(keep_indices) / len(indices))
         self.args.logger.info(
-            f"Epoch {epoch}: Kept {len(updated_indices)}/{len(indices)} points after detrimental filtering "
+            f"Epoch {epoch}: Kept {len(keep_indices)}/{len(indices)} points after detrimental filtering "
             f"({drop_percentage:.2f}% dropped)"
         )
         
-        # Log detailed metrics about cluster weights
+        # Log detailed metrics
         if self.args.use_wandb:
             metrics = {
                 'epoch': epoch,
                 'training_step': training_step,
-                'detrimental_drop_count': len(updated_indices),
-                'detrimental_drop_percentage': drop_percentage
+                'detrimental_drop_count': len(keep_indices),
+                'detrimental_drop_percentage': drop_percentage,
+                'cluster_count': np.max(cluster) + 1 if 'cluster' in locals() else 0,
+                'small_cluster_count': len(small_clusters) if 'small_clusters' in locals() else 0,
+                'cluster_threshold': threshold if 'threshold' in locals() else 0
             }
-            
-            if len(subset_weights) > 0:
-                metrics.update({
-                    'min_cluster_weight': np.min(subset_weights),
-                    'max_cluster_weight': np.max(subset_weights),
-                    'mean_cluster_weight': np.mean(subset_weights),
-                    'cluster_threshold': self.args.cluster_thresh,
-                    'valid_clusters_count': len(valid_clusters),
-                    'total_clusters_count': len(subset_weights)
-                })
-                
             wandb.log(metrics)
         
-        return updated_indices
+        return keep_indices
 
     def _select_random_set(self) -> np.ndarray:
         indices = []
@@ -485,14 +488,14 @@ class CRESTTrainer(SubsetTrainer):
         self.subset = []
         self.subset_weights = []
         
-        # Track selection for metrics (originally done in parent method)
+        # Track selection for metrics 
         self.num_selection += 1
         
-        # Log selection event to wandb (originally done in parent method)
+        # Log selection event to wandb 
         if self.args.use_wandb:
             wandb.log({"epoch": epoch, "training_step": training_step, "num_selection": self.num_selection})
             
-        # Handle dataset caching if needed (originally done in parent method)
+        # Handle dataset caching if needed 
         if self.args.cache_dataset:
             self.train_dataset.clean()
             self.train_dataset.cache()
@@ -530,9 +533,12 @@ class CRESTTrainer(SubsetTrainer):
 
 
         time_start = time.time()
-        self._get_train_output()  # Update all random_set gradient.
+        # Only compute outputs for the combined random sets, not the entire dataset
+        self._get_train_output(indices=np.concatenate(self.random_sets))  # Only update outputs for the random sets
         time_end = time.time()
         self.args.logger.info(f"_get_train_output: {time_end - time_start:.2f} seconds")
+        
+        
         # ----------------------------
         # 3. Process each random subset individually
         # ----------------------------
@@ -594,7 +600,6 @@ class CRESTTrainer(SubsetTrainer):
                         # Note: We reuse the gradients already computed above rather than recalculating
                         features = gradients
                         
-                        
                         time_start = time.time()
                         # This explicitly optimizes the joint objective from the theory
                         subset_indices, weights = self.subset_generator.generate_mixed_subset(
@@ -654,6 +659,4 @@ class CRESTTrainer(SubsetTrainer):
                 'final_subset_size': total_remaining,
                 'joint_dpp_applied': hasattr(self.subset_generator, 'generate_mixed_subset')
             })
-
-
 

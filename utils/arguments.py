@@ -93,8 +93,8 @@ def get_args():
     # detrimental example dropping
     parser.add_argument('--drop_detrimental', default=True, type=parse_bool, const=True, nargs='?', help='drop detrimental examples')
     parser.add_argument('--cluster_thresh', default=1, type=int, help='cluster size threshold')
-    parser.add_argument('--detrimental_sampled', default=500, type=int, help='Specifies the maximum number of data points to sample for detrimental data processing.')
-    parser.add_argument('--target_drop_percentage', default='10', type=int, help='how many data points are dropped based on cluster weights.')
+    parser.add_argument('--detrimental_cluster_num', default=64, type=int, help='Number of clusters to create.')
+    parser.add_argument('--target_drop_percentage', default=0, type=int, help='Further drop after cluster_thresh drop.')
     parser.add_argument('--drop_after', default=0, type=int, help='epoch to start dropping detrimental examples')
     parser.add_argument('--optimizer', default="LazyGreedy", type=str, help='optimizer for detrimental instance dropping')
 
