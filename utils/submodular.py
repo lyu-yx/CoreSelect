@@ -348,7 +348,6 @@ def get_orders_and_weights_hybrid(
     - order_mg: np.array, shape [B], type int64 - selected indices
     - weights_mg: np.array, shape [B], type float32, sums to 1 - weights
     """
-    from time import time
     import numpy as np
     try:
         from submodlib import FacilityLocationFunction, LogDeterminantFunction
@@ -402,7 +401,7 @@ def get_orders_and_weights_hybrid(
                 class_features = class_features / (norms + 1e-8)
                 
             # Time similarity computation
-            sim_start = time()
+            sim_start = time.time()
             
             # Use sparse mode for large datasets - compute on demand
             if has_submodlib:
@@ -431,10 +430,10 @@ def get_orders_and_weights_hybrid(
                     similarity_matrix = -np.sum((class_features[:, None, :] - 
                                              class_features[None, :, :]) ** 2, axis=2)
             
-            sim_time = time() - sim_start
+            sim_time = time.time() - sim_start
             
             # Time greedy selection
-            greedy_start = time()
+            greedy_start = time.time()
             
             if has_submodlib:
                 if dpp_weight > 0:
@@ -525,11 +524,11 @@ def get_orders_and_weights_hybrid(
                 else:
                     cluster_sizes = np.array([])
                     
-            greedy_time = time() - greedy_start
+            greedy_time = time.time() - greedy_start
                 
         else:
             # Dense mode for smaller datasets - use precomputed similarity
-            sim_start = time()
+            sim_start = time.time()
             
             # Normalize features if using cosine similarity
             if metric == "cosine":
@@ -540,10 +539,10 @@ def get_orders_and_weights_hybrid(
                 similarity_matrix = -np.sum((class_features[:, None, :] - 
                                          class_features[None, :, :]) ** 2, axis=2)
             
-            sim_time = time() - sim_start
+            sim_time = time.time() - sim_start
             
             # Time greedy selection
-            greedy_start = time()
+            greedy_start = time.time()
             
             if has_submodlib:
                 # Using submodlib
@@ -642,7 +641,7 @@ def get_orders_and_weights_hybrid(
                 else:
                     cluster_sizes = np.array([])
                 
-            greedy_time = time() - greedy_start
+            greedy_time = time.time() - greedy_start
         
         # Map local indices back to global indices
         global_indices = class_indices[selected]

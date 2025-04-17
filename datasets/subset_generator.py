@@ -6,7 +6,7 @@ from enum import Enum
 import numpy as np
 import torch
 from utils import submodular, craig
-from time import time
+import time  # Changed from: from time import time
 
 class SubsetGenerator:
     def __init__(self, greedy: bool = True, smtk: float = 1.0):
@@ -74,7 +74,7 @@ class SubsetGenerator:
                 return indices, weights
             
             # Start timer for performance tracking
-            start_time = time()
+            start_time = time.time()  # Changed from: start_time = time()
             
             try:
                 # Try to import utility functions
@@ -105,7 +105,7 @@ class SubsetGenerator:
                 # Fall back to the class-parallel implementation we added previously
                 
                 # Start timer for performance tracking
-                start_time = time()
+                start_time = time.time()  # Changed from: start_time = time()
                 
                 # Implement class-based parallel processing for mixed selection
                 # This approach follows the pattern in get_orders_and_weights
@@ -322,7 +322,7 @@ class SubsetGenerator:
                     weights = np.array([], dtype=np.float32)
                 
                 # Calculate total selection time
-                selection_time = time() - start_time
+                selection_time = time.time() - start_time  # Changed from: selection_time = time() - start_time
                 print(f"Mixed selection completed in {selection_time:.2f} seconds")
                 
                 return indices, weights
