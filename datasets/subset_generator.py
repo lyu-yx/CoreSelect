@@ -67,193 +67,263 @@ class SubsetGenerator:
             return indices, weights
             
         else:  # "mixed" or default - this is the joint objective approach
-            # Implement mixed logic directly to avoid issues with MixtureFunction
+            # If not greedy, just return random samples with equal weights
             if not self.greedy:
-                # If not greedy, just return random samples with equal weights
                 indices = np.random.choice(len(features), subset_size, replace=False)
                 weights = np.ones(subset_size) / subset_size
                 return indices, weights
             
+            # Start timer for performance tracking
+            start_time = time()
+            
             try:
-                # Try to import submodlib functions
-                from submodlib import FacilityLocationFunction, LogDeterminantFunction
+                # Try to import utility functions
+                from utils.submodular import get_orders_and_weights_hybrid
                 
-                # Normalize features for kernel computation
+                # Normalize features for kernel computation (important for distance metrics)
                 X = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-8)
-                similarity_matrix = np.dot(X, X.T)
                 
-                # Coverage function: Facility Location (submodular)
-                fl_obj = FacilityLocationFunction(
-                    n=len(features),
-                    mode="dense",
-                    sijs=similarity_matrix,
-                    separate_rep=False
+                # Use the optimized hybrid implementation that combines coverage and diversity
+                # with class-based parallel processing
+                indices, weights, _, _, selection_time, _ = get_orders_and_weights_hybrid(
+                    B=subset_size,
+                    X=X,
+                    metric="cosine",  # Cosine similarity works well for normalized embeddings
+                    y=labels,
+                    dpp_weight=dpp_weight,  # Use the provided diversity weight
+                    mode="sparse" if len(features) > 10000 else "dense",  # Adaptive mode selection
+                    num_n=128  # Number of neighbors for sparse computation
                 )
                 
-                # Diversity function: Log Determinant (DPP)
-                dpp_obj = LogDeterminantFunction(
-                    n=len(features),
-                    mode="dense",
-                    sijs=similarity_matrix,
-                    lambdaVal=1.0
-                )
-                
-                # Manual implementation of joint selection
-                selected_indices = []
-                remaining = list(range(len(features)))
-                
-                # Start timer for performance tracking
-                start_time = time()
-                
-                # More efficient implementation inspired by get_orders_and_weights
-                # Instead of nested loops, compute gains in vectorized form
-                for _ in range(min(subset_size, len(features))):
-                    if not remaining:
-                        break
-                    
-                    # Calculate gains for all remaining indices at once if possible
-                    if len(selected_indices) == 0:
-                        # For the first element, we compute both objectives directly
-                        # For FL: Each point's representation score is its row sum in similarity matrix
-                        fl_gains = np.sum(similarity_matrix[remaining, :], axis=1)
-                        
-                        # For DPP: With empty set, it's the log of diagonal elements (self-similarity)
-                        dpp_gains = np.log(np.diag(similarity_matrix)[remaining] + 1e-10)
-                        
-                        # Combine gains with weights
-                        combined_gains = (1 - dpp_weight) * fl_gains + dpp_weight * dpp_gains
-                        
-                        # Find the best point
-                        best_local_idx = np.argmax(combined_gains)
-                        best_idx = remaining[best_local_idx]
-                        
-                    else:
-                        # For subsequent elements, we need to compute marginal gains
-                        # Convert current selection to set for evaluation
-                        current_set = set(selected_indices)
-                        
-                        # Precompute base values for current set
-                        fl_prev = fl_obj.evaluate(current_set)
-                        dpp_prev = dpp_obj.evaluate(current_set)
-                        
-                        # Vectorize marginal gain calculation
-                        best_gain = -float('inf')
-                        best_idx = -1
-                        
-                        # We'll compute gains in smaller batches to avoid memory issues
-                        batch_size = min(1000, len(remaining))
-                        for i in range(0, len(remaining), batch_size):
-                            batch_indices = remaining[i:i+batch_size]
-                            
-                            fl_gains = []
-                            dpp_gains = []
-                            
-                            # This loop is over a batch, not the full remaining set
-                            for idx in batch_indices:
-                                # We still need to evaluate each point for its marginal gain
-                                # but we're processing in batches
-                                temp_set = current_set.copy()
-                                temp_set.add(idx)
-                                
-                                fl_curr = fl_obj.evaluate(temp_set)
-                                fl_gain = fl_curr - fl_prev
-                                
-                                dpp_curr = dpp_obj.evaluate(temp_set)
-                                dpp_gain = dpp_curr - dpp_prev
-                                
-                                fl_gains.append(fl_gain)
-                                dpp_gains.append(dpp_gain)
-                            
-                            # Convert to numpy arrays for vectorized operations
-                            fl_gains = np.array(fl_gains)
-                            dpp_gains = np.array(dpp_gains)
-                            
-                            # Combine gains with weights
-                            combined_gains = (1 - dpp_weight) * fl_gains + dpp_weight * dpp_gains
-                            
-                            # Find the best point in this batch
-                            local_best_idx = np.argmax(combined_gains)
-                            local_best_gain = combined_gains[local_best_idx]
-                            
-                            if local_best_gain > best_gain:
-                                best_gain = local_best_gain
-                                best_idx = batch_indices[local_best_idx]
-                    
-                    # Add the best element
-                    if best_idx != -1:
-                        selected_indices.append(best_idx)
-                        remaining.remove(best_idx)
-                
-                # Calculate total selection time
-                selection_time = time() - start_time
-                print(f"Mixed selection completed in {selection_time:.2f} seconds")
-                
-                indices = np.array(selected_indices)
-                
-                # Calculate weights based on normalized similarity to other samples
-                if len(indices) > 0:
-                    row_sums = np.sum(similarity_matrix[indices, :], axis=1)
-                    weights = row_sums / np.sum(row_sums)  # Normalize to sum to 1
-                else:
-                    weights = np.array([], dtype=float)
+                # Log performance
+                print(f"Hybrid mixed selection completed in {selection_time:.2f} seconds")
                 
                 return indices, weights
                 
             except ImportError:
-                # Fall back to basic implementation if submodlib isn't available
-                print("SubModLib not found. Using basic joint selection.")
+                print("Could not import get_orders_and_weights_hybrid. Using class-parallel implementation.")
+                # Fall back to the class-parallel implementation we added previously
                 
-                # Normalize features for kernel computation
-                X = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-8)
-                similarity_matrix = np.dot(X, X.T)
+                # Start timer for performance tracking
+                start_time = time()
                 
-                # Initialize selection data structures
-                selected = []
-                remaining = list(range(len(features)))
-                selected_scores = []
+                # Implement class-based parallel processing for mixed selection
+                # This approach follows the pattern in get_orders_and_weights
                 
-                # Greedy joint selection - combining both coverage and diversity objectives
-                for i in range(min(subset_size, len(features))):
-                    if not remaining:
-                        break
+                # 1. Split data by class
+                classes = np.unique(labels)
+                C = len(classes)  # number of classes
+                
+                # 2. Determine the number of samples to select per class
+                class_counts = [np.sum(labels == c) for c in classes]
+                class_fractions = np.array(class_counts) / len(labels)
+                num_per_class = np.int32(np.ceil(class_fractions * subset_size))
+                
+                # Ensure we don't select more than subset_size elements
+                while np.sum(num_per_class) > subset_size:
+                    # Find the class with the largest allocation and reduce by 1
+                    idx_to_reduce = np.argmax(num_per_class)
+                    num_per_class[idx_to_reduce] -= 1
+                
+                print(f"Mixed selection: selecting {num_per_class} elements per class")
+                
+                # 3. Define function to process each class in parallel
+                def process_class(class_data):
+                    c_idx, c_num = class_data
+                    class_indices = np.where(labels == classes[c_idx])[0]
+                    if len(class_indices) == 0 or c_num == 0:
+                        return [], []
                     
-                    best_idx = -1
-                    best_score = -float('inf')
+                    # Extract class-specific data
+                    class_features = features[class_indices]
                     
-                    for idx in remaining:
-                        # COVERAGE TERM: How well this point represents the dataset
-                        coverage_score = np.sum(similarity_matrix[idx, :]) / len(features)
-                        
-                        # DIVERSITY TERM: How different this point is from already selected points
-                        diversity_score = 0
-                        if selected:
-                            sim_to_selected = np.mean(similarity_matrix[idx, selected])
-                            diversity_score = 1 - sim_to_selected  # Invert for diversity
-                        
-                        # Combined score with weighting
-                        score = (1 - dpp_weight) * coverage_score + dpp_weight * diversity_score
-                        
-                        if score > best_score:
-                            best_score = score
-                            best_idx = idx
+                    # Normalize features for kernel computation
+                    X = class_features / (np.linalg.norm(class_features, axis=1, keepdims=True) + 1e-8)
+                    similarity_matrix = np.dot(X, X.T)
                     
-                    if best_idx != -1:
-                        selected.append(best_idx)
-                        selected_scores.append(best_score)
-                        remaining.remove(best_idx)
+                    try:
+                        # Try to import submodlib functions
+                        from submodlib import FacilityLocationFunction, LogDeterminantFunction
+                        
+                        # Define objectives per class
+                        fl_obj = FacilityLocationFunction(
+                            n=len(class_features),
+                            mode="dense",
+                            sijs=similarity_matrix,
+                            separate_rep=False
+                        )
+                        
+                        dpp_obj = LogDeterminantFunction(
+                            n=len(class_features),
+                            mode="dense",
+                            sijs=similarity_matrix,
+                            lambdaVal=1.0
+                        )
+                        
+                        # Initialize selection for this class
+                        class_selected = []
+                        class_remaining = list(range(len(class_features)))
+                        
+                        # Select elements for this class
+                        for _ in range(min(c_num, len(class_features))):
+                            if not class_remaining:
+                                break
+                            
+                            if len(class_selected) == 0:
+                                # First element: compute objectives directly
+                                fl_gains = np.sum(similarity_matrix[class_remaining, :], axis=1)
+                                dpp_gains = np.log(np.diag(similarity_matrix)[class_remaining] + 1e-10)
+                                
+                                # Combine gains with weights
+                                combined_gains = (1 - dpp_weight) * fl_gains + dpp_weight * dpp_gains
+                                
+                                # Find the best point
+                                best_local_idx = np.argmax(combined_gains)
+                                best_idx = class_remaining[best_local_idx]
+                                
+                            else:
+                                # Subsequent elements: compute marginal gains
+                                current_set = set(class_selected)
+                                fl_prev = fl_obj.evaluate(current_set)
+                                dpp_prev = dpp_obj.evaluate(current_set)
+                                
+                                best_gain = -float('inf')
+                                best_idx = -1
+                                
+                                # Process in batches
+                                batch_size = min(1000, len(class_remaining))
+                                for i in range(0, len(class_remaining), batch_size):
+                                    batch_indices = class_remaining[i:i+batch_size]
+                                    
+                                    fl_gains = []
+                                    dpp_gains = []
+                                    
+                                    for idx in batch_indices:
+                                        temp_set = current_set.copy()
+                                        temp_set.add(idx)
+                                        
+                                        fl_curr = fl_obj.evaluate(temp_set)
+                                        fl_gain = fl_curr - fl_prev
+                                        
+                                        dpp_curr = dpp_obj.evaluate(temp_set)
+                                        dpp_gain = dpp_curr - dpp_prev
+                                        
+                                        fl_gains.append(fl_gain)
+                                        dpp_gains.append(dpp_gain)
+                                    
+                                    # Convert to numpy arrays
+                                    fl_gains = np.array(fl_gains)
+                                    dpp_gains = np.array(dpp_gains)
+                                    
+                                    # Combine gains with weights
+                                    combined_gains = (1 - dpp_weight) * fl_gains + dpp_weight * dpp_gains
+                                    
+                                    # Find the best point in this batch
+                                    local_best_idx = np.argmax(combined_gains)
+                                    local_best_gain = combined_gains[local_best_idx]
+                                    
+                                    if local_best_gain > best_gain:
+                                        best_gain = local_best_gain
+                                        best_idx = batch_indices[local_best_idx]
+                            
+                            # Add the best element
+                            if best_idx != -1:
+                                class_selected.append(best_idx)
+                                class_remaining.remove(best_idx)
+                        
+                        # Convert local indices to global
+                        global_indices = [class_indices[idx] for idx in class_selected]
+                        
+                        # Calculate weights for this class
+                        if len(class_selected) > 0:
+                            row_sums = np.sum(similarity_matrix[class_selected, :], axis=1)
+                            class_weights = row_sums / np.sum(row_sums)
+                        else:
+                            class_weights = []
+                            
+                        return global_indices, class_weights
+                    
+                    except ImportError:
+                        # Fall back to numpy implementation if submodlib not available
+                        print("SubModLib not found. Using numpy implementation for class processing.")
+                        
+                        # Initialize selection
+                        selected = []
+                        remaining = list(range(len(class_features)))
+                        
+                        # Select elements greedily
+                        for _ in range(min(c_num, len(class_features))):
+                            if not remaining:
+                                break
+                                
+                            if not selected:
+                                # For first element, select point with best combined score
+                                coverage_scores = np.sum(similarity_matrix[remaining, :], axis=1)
+                                diversity_scores = np.log(np.diag(similarity_matrix)[remaining] + 1e-10)
+                                combined_scores = (1 - dpp_weight) * coverage_scores + dpp_weight * diversity_scores
+                                best_idx = remaining[np.argmax(combined_scores)]
+                                selected.append(best_idx)
+                                remaining.remove(best_idx)
+                            else:
+                                # For subsequent elements
+                                best_idx = -1
+                                best_score = -float('inf')
+                                
+                                for idx in remaining:
+                                    # Coverage component: additional similarity to uncovered points
+                                    coverage_score = np.sum(similarity_matrix[idx, :]) / len(class_features)
+                                    
+                                    # Diversity component: dissimilarity to already selected
+                                    sim_to_selected = np.mean(similarity_matrix[idx, selected])
+                                    diversity_score = 1 - sim_to_selected
+                                    
+                                    # Combined score
+                                    score = (1 - dpp_weight) * coverage_score + dpp_weight * diversity_score
+                                    
+                                    if score > best_score:
+                                        best_score = score
+                                        best_idx = idx
+                                        
+                                selected.append(best_idx)
+                                remaining.remove(best_idx)
+                        
+                        # Convert local indices to global
+                        global_indices = [class_indices[idx] for idx in selected]
+                        
+                        # Calculate weights
+                        if len(selected) > 0:
+                            row_sums = np.sum(similarity_matrix[selected, :], axis=1)
+                            class_weights = row_sums / np.sum(row_sums)
+                        else:
+                            class_weights = []
+                            
+                        return global_indices, class_weights
                 
-                indices = np.array(selected)
+                # 4. Process each class in parallel with efficient result collection
+                class_data = [(c_idx, num_per_class[c_idx]) for c_idx in range(len(classes))]
+                processed_results = list(map(process_class, class_data))
                 
-                # Calculate weights based on the selection scores
+                # 5. Combine results efficiently (replacing inefficient np.append loops)
+                # Pre-calculate total size for pre-allocation
+                total_indices = sum(len(indices) for indices, _ in processed_results)
+                
+                # Use list comprehensions for collecting data
+                all_indices = [idx for result in processed_results for idx in result[0]]
+                all_weights = [w for result in processed_results for w in result[1]]
+                
+                # Convert to numpy arrays
+                indices = np.array(all_indices, dtype=np.int32)
+                
                 if len(indices) > 0:
-                    weights = np.array(selected_scores)
-                    # Ensure positive weights
-                    if np.min(weights) < 0:
-                        weights = weights - np.min(weights) + 1e-8
-                    # Normalize weights to sum to 1
-                    weights = weights / np.sum(weights)
+                    # Normalize the weights
+                    weights = np.array(all_weights, dtype=np.float32)
+                    weights = weights / np.sum(weights)  # Normalize to sum to 1
                 else:
-                    weights = np.array([], dtype=float)
+                    weights = np.array([], dtype=np.float32)
+                
+                # Calculate total selection time
+                selection_time = time() - start_time
+                print(f"Mixed selection completed in {selection_time:.2f} seconds")
                 
                 return indices, weights
     

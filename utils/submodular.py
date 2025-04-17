@@ -322,6 +322,362 @@ def get_orders_and_weights_detrimental(B, X, metric, y=None, weights=None, equal
     return vals
 
 
+def get_orders_and_weights_hybrid(
+    B,
+    X,
+    metric,
+    y=None,
+    weights=None,
+    equal_num=False,
+    dpp_weight=0.3,  # Weight for DPP diversity (0 = pure FL, 1 = pure DPP)
+    mode="sparse",
+    num_n=128,
+):
+    """
+    Hybrid facility location + DPP selection for both coverage and diversity.
+    
+    Args:
+    - X: np.array, shape [N, d]
+    - B: int, number of points to select
+    - metric: str, one of ['cosine', 'euclidean'], for similarity
+    - y: np.array, shape [N], integer class labels for C classes
+    - dpp_weight: float in [0,1], weight for diversity vs coverage
+    - mode: str, one of ['sparse', 'dense'] for computation mode
+    
+    Returns:
+    - order_mg: np.array, shape [B], type int64 - selected indices
+    - weights_mg: np.array, shape [B], type float32, sums to 1 - weights
+    """
+    from time import time
+    import numpy as np
+    try:
+        from submodlib import FacilityLocationFunction, LogDeterminantFunction
+        has_submodlib = True
+    except ImportError:
+        has_submodlib = False
+        print("Warning: submodlib not found, falling back to numpy implementation")
+    
+    N = X.shape[0]
+    if y is None:
+        y = np.zeros(N, dtype=np.int32)  # assign every point to the same class
+    
+    classes = np.unique(y)
+    classes = classes.astype(np.int32).tolist()
+    C = len(classes)  # number of classes
+
+    # Determine number of points to select per class
+    if equal_num:
+        class_nums = [sum(y == c) for c in classes]
+        num_per_class = int(np.ceil(B / C)) * np.ones(len(classes), dtype=np.int32)
+        minority = np.array([class_nums[c] < np.ceil(B / C) for c in classes])
+        
+        if sum(minority) > 0:
+            extra = sum([max(0, np.ceil(B / C) - class_nums[c]) for c in classes])
+            for c_idx, c in enumerate(classes):
+                if not minority[c_idx]:
+                    num_per_class[c_idx] += int(np.ceil(extra / sum(~minority)))
+    else:
+        num_per_class = np.int32(
+            np.ceil(np.divide([sum(y == i) for i in classes], N) * B)
+        )
+
+    print(f"Hybrid selection: selecting {num_per_class} elements per class")
+    
+    # Define function to process each class in parallel
+    def process_class(class_data):
+        c_idx, c = class_data
+        class_indices = np.where(y == c)[0]
+        target_count = num_per_class[c_idx]
+        
+        if len(class_indices) == 0 or target_count == 0:
+            return [], [], 0, 0
+            
+        class_features = X[class_indices]
+        
+        # Use sparse mode for efficiency when appropriate
+        if mode == "sparse" or len(class_indices) > 10000:
+            # Normalize features if using cosine similarity
+            if metric == "cosine":
+                norms = np.linalg.norm(class_features, axis=1, keepdims=True)
+                class_features = class_features / (norms + 1e-8)
+                
+            # Time similarity computation
+            sim_start = time()
+            
+            # Use sparse mode for large datasets - compute on demand
+            if has_submodlib:
+                # Using submodlib's implementation
+                fl_obj = FacilityLocationFunction(
+                    n=len(class_features),
+                    mode="sparse",
+                    data=class_features,
+                    metric=metric,
+                )
+                
+                # Add DPP if diversity weight > 0
+                if dpp_weight > 0:
+                    dpp_obj = LogDeterminantFunction(
+                        n=len(class_features),
+                        mode="sparse", 
+                        data=class_features,
+                        metric=metric,
+                    )
+            else:
+                # Fallback to numpy - compute similarity matrix
+                if metric == "cosine":
+                    similarity_matrix = np.dot(class_features, class_features.T)
+                else:  # euclidean
+                    # Efficient pairwise distance without materializing full matrix
+                    similarity_matrix = -np.sum((class_features[:, None, :] - 
+                                             class_features[None, :, :]) ** 2, axis=2)
+            
+            sim_time = time() - sim_start
+            
+            # Time greedy selection
+            greedy_start = time()
+            
+            if has_submodlib:
+                if dpp_weight > 0:
+                    # Hybrid approach with both objectives
+                    from submodlib.functions.mixtureFunctions import MixtureFunction
+                    mixture_obj = MixtureFunction(
+                        functions=[fl_obj, dpp_obj],
+                        weights=[(1 - dpp_weight), dpp_weight]
+                    )
+                    selected = mixture_obj.maximize(
+                        budget=target_count,
+                        optimizer="LazyGreedy",
+                        stopIfZeroGain=False,
+                        verbose=False
+                    )
+                else:
+                    # Pure facility location
+                    selected = fl_obj.maximize(
+                        budget=target_count,
+                        optimizer="LazyGreedy",
+                        stopIfZeroGain=False,
+                        verbose=False
+                    )
+                    
+                # Get cluster sizes (weights)
+                if len(selected) > 0:
+                    # Compute row sums for weighting
+                    if mode == "sparse":
+                        # Compute similarity matrix only for selected points
+                        sel_features = class_features[selected]
+                        if metric == "cosine":
+                            sel_sim = np.dot(sel_features, class_features.T)
+                        else:  # euclidean
+                            sel_sim = -np.sum((sel_features[:, None, :] - 
+                                          class_features[None, :, :]) ** 2, axis=2)
+                        cluster_sizes = np.sum(sel_sim, axis=1)
+                    else:
+                        cluster_sizes = np.sum(similarity_matrix[selected], axis=1)
+                else:
+                    cluster_sizes = np.array([])
+            else:
+                # Numpy-based greedy facility location
+                selected = []
+                remaining = list(range(len(class_features)))
+                
+                for _ in range(min(target_count, len(class_features))):
+                    if not remaining:
+                        break
+                        
+                    if len(selected) == 0:
+                        # First element - pure coverage
+                        fl_gains = np.sum(similarity_matrix[remaining], axis=1)
+                        best_idx = remaining[np.argmax(fl_gains)]
+                    else:
+                        best_gain = -float('inf')
+                        best_idx = -1
+                        
+                        for idx in remaining:
+                            # For facility location: gain is the additional coverage
+                            curr_sim = similarity_matrix[idx]
+                            # For each point, compute its similarity to this candidate or
+                            # its similarity to already selected items, whichever is higher
+                            gain = 0
+                            for j in range(len(similarity_matrix)):
+                                if j not in selected:
+                                    gain += max(curr_sim[j], 
+                                               max([similarity_matrix[s, j] for s in selected]))
+                                    
+                            # Mix in diversity if needed
+                            if dpp_weight > 0:
+                                # Simple diversity penalty based on similarity to selected points
+                                sim_to_selected = np.mean([similarity_matrix[idx, s] for s in selected])
+                                diversity_term = 1 - sim_to_selected
+                                
+                                # Combined objective
+                                gain = (1 - dpp_weight) * gain + dpp_weight * diversity_term
+                                
+                            if gain > best_gain:
+                                best_gain = gain
+                                best_idx = idx
+                                
+                    selected.append(best_idx)
+                    remaining.remove(best_idx)
+                
+                # Calculate weights
+                if selected:
+                    cluster_sizes = np.sum(similarity_matrix[selected], axis=1)
+                else:
+                    cluster_sizes = np.array([])
+                    
+            greedy_time = time() - greedy_start
+                
+        else:
+            # Dense mode for smaller datasets - use precomputed similarity
+            sim_start = time()
+            
+            # Normalize features if using cosine similarity
+            if metric == "cosine":
+                norms = np.linalg.norm(class_features, axis=1, keepdims=True)
+                class_features = class_features / (norms + 1e-8)
+                similarity_matrix = np.dot(class_features, class_features.T)
+            else:  # euclidean
+                similarity_matrix = -np.sum((class_features[:, None, :] - 
+                                         class_features[None, :, :]) ** 2, axis=2)
+            
+            sim_time = time() - sim_start
+            
+            # Time greedy selection
+            greedy_start = time()
+            
+            if has_submodlib:
+                # Using submodlib
+                fl_obj = FacilityLocationFunction(
+                    n=len(class_features),
+                    mode="dense",
+                    sijs=similarity_matrix,
+                    separate_rep=False
+                )
+                
+                # Add DPP if diversity weight > 0
+                if dpp_weight > 0:
+                    dpp_obj = LogDeterminantFunction(
+                        n=len(class_features),
+                        mode="dense", 
+                        sijs=similarity_matrix,
+                        lambdaVal=1.0
+                    )
+                    
+                    # Hybrid approach with both objectives
+                    from submodlib.functions.mixtureFunctions import MixtureFunction
+                    mixture_obj = MixtureFunction(
+                        functions=[fl_obj, dpp_obj],
+                        weights=[(1 - dpp_weight), dpp_weight]
+                    )
+                    selected = mixture_obj.maximize(
+                        budget=target_count,
+                        optimizer="LazyGreedy", 
+                        stopIfZeroGain=False,
+                        verbose=False
+                    )
+                else:
+                    # Pure facility location
+                    selected = fl_obj.maximize(
+                        budget=target_count,
+                        optimizer="LazyGreedy",
+                        stopIfZeroGain=False,
+                        verbose=False
+                    )
+                
+                # Calculate weights
+                if len(selected) > 0:
+                    cluster_sizes = np.sum(similarity_matrix[selected], axis=1)
+                else:
+                    cluster_sizes = np.array([])
+            else:
+                # Numpy-based implementation
+                selected = []
+                remaining = list(range(len(class_features)))
+                
+                for _ in range(min(target_count, len(class_features))):
+                    if not remaining:
+                        break
+                        
+                    if len(selected) == 0:
+                        # First element - pure coverage
+                        fl_gains = np.sum(similarity_matrix[remaining], axis=1)
+                        best_idx = remaining[np.argmax(fl_gains)]
+                    else:
+                        best_gain = -float('inf')
+                        best_idx = -1
+                        
+                        for idx in remaining:
+                            # Calculate marginal gain for coverage
+                            current_values = np.zeros(len(class_features))
+                            for j in selected:
+                                current_values = np.maximum(current_values, similarity_matrix[j])
+                                
+                            candidate_values = np.maximum(current_values, similarity_matrix[idx])
+                            fl_gain = np.sum(candidate_values) - np.sum(current_values)
+                            
+                            # Mix in diversity if needed
+                            if dpp_weight > 0:
+                                # Simple diversity penalty based on similarity to selected points
+                                if len(selected) > 0:
+                                    sim_to_selected = np.mean(similarity_matrix[idx, selected])
+                                    diversity_term = 1 - sim_to_selected
+                                else:
+                                    diversity_term = 1.0
+                                    
+                                # Combined gain
+                                gain = (1 - dpp_weight) * fl_gain + dpp_weight * diversity_term
+                            else:
+                                gain = fl_gain
+                                
+                            if gain > best_gain:
+                                best_gain = gain
+                                best_idx = idx
+                                
+                    selected.append(best_idx)
+                    remaining.remove(best_idx)
+                
+                # Calculate weights
+                if selected:
+                    cluster_sizes = np.sum(similarity_matrix[selected], axis=1)
+                else:
+                    cluster_sizes = np.array([])
+                
+            greedy_time = time() - greedy_start
+        
+        # Map local indices back to global indices
+        global_indices = class_indices[selected]
+        
+        return global_indices, cluster_sizes, greedy_time, sim_time
+    
+    # Process each class in parallel with map
+    class_data = [(c_idx, c) for c_idx, c in enumerate(classes)]
+    all_results = list(map(process_class, class_data))
+    
+    # Unpack results
+    all_indices, all_weights, greedy_times, similarity_times = zip(*all_results)
+    
+    # Faster merging using pre-allocation where possible
+    total_selected = sum(len(indices) for indices in all_indices)
+    
+    # More efficient merging using list comprehension and np.concatenate
+    order_mg = np.concatenate(all_indices) if all_indices else np.array([], dtype=np.int32)
+    weights_mg = np.concatenate(all_weights) if all_weights else np.array([], dtype=np.float32)
+    
+    # Normalize weights if we have any
+    if len(weights_mg) > 0:
+        weights_mg = weights_mg / np.sum(weights_mg)
+    
+    # Use max timing
+    ordering_time = np.max(greedy_times) if greedy_times else 0
+    similarity_time = np.max(similarity_times) if similarity_times else 0
+    
+    # Legacy output format for compatibility
+    order_sz = []
+    weights_sz = []
+    vals = order_mg, weights_mg, order_sz, weights_sz, ordering_time, similarity_time
+    return vals
+
+
 def greedy_merge(X, y, B, part_num, metric):  
     '''
     preds, fl_labels, B, 5, "euclidean",

@@ -489,6 +489,8 @@ class CRESTTrainer(SubsetTrainer):
         self.subset_weights = []
         
         # Track selection for metrics 
+        if not hasattr(self, 'num_selection'):
+            self.num_selection = 0
         self.num_selection += 1
         
         # Log selection event to wandb 
@@ -500,7 +502,7 @@ class CRESTTrainer(SubsetTrainer):
             self.train_dataset.clean()
             self.train_dataset.cache()
             
-        # Continue with the existing implementation
+        # Generate stratified random subsets
         for _ in range(self.args.num_minibatch_coreset):
             # Select a random subset of global indices.
             random_subset = self._select_random_set()
@@ -517,27 +519,29 @@ class CRESTTrainer(SubsetTrainer):
             time_start = time.time()
             self._drop_learned_data(epoch, training_step, combined_random_sets)
             time_end = time.time()
-            self.args.logger.info(f"dropping learned data: {time_end - time_start:.2f} seconds")
+            self.args.logger.info(f"Dropping learned data: {time_end - time_start:.2f} seconds")
             
         # Filter each random set so they contain only indices in self.train_indices.
         self.random_sets = [np.intersect1d(rs, self.train_indices) for rs in self.random_sets]
         
         # Update the DataLoader based on the filtered indices.
-        self.train_val_loader = DataLoader(
-            Subset(self.train_dataset, indices=np.concatenate(self.random_sets)),
-            batch_size=self.args.batch_size,
-            shuffle=True,
-            num_workers=self.args.num_workers,
-            pin_memory=True,
-        )
+        filtered_random_sets = np.concatenate([rs for rs in self.random_sets if len(rs) > 0]) if self.random_sets else np.array([])
+        if len(filtered_random_sets) > 0:
+            self.train_val_loader = DataLoader(
+                Subset(self.train_dataset, indices=filtered_random_sets),
+                batch_size=self.args.batch_size,
+                shuffle=True,
+                num_workers=self.args.num_workers,
+                pin_memory=True,
+            )
 
-
-        time_start = time.time()
-        # Only compute outputs for the combined random sets, not the entire dataset
-        self._get_train_output(indices=np.concatenate(self.random_sets))  # Only update outputs for the random sets
-        time_end = time.time()
-        self.args.logger.info(f"_get_train_output: {time_end - time_start:.2f} seconds")
-        
+            time_start = time.time()
+            # Only compute outputs for the filtered random sets, not the entire dataset
+            self._get_train_output(indices=filtered_random_sets)
+            time_end = time.time()
+            self.args.logger.info(f"_get_train_output: {time_end - time_start:.2f} seconds")
+        else:
+            self.args.logger.warning("No samples remaining after filtering random sets with train_indices")
         
         # ----------------------------
         # 3. Process each random subset individually
@@ -546,104 +550,150 @@ class CRESTTrainer(SubsetTrainer):
         processed_subsets = []
         processed_weights = []
         
-        for orig_random_set in self.random_sets:
+        for i, orig_random_set in enumerate(self.random_sets):
             # Make a local copy so that we do not affect the global self.random_sets.
             local_set = orig_random_set.copy()
             
+            # Skip processing if local_set is empty
+            if len(local_set) == 0:
+                self.args.logger.warning(f"Empty local set #{i} - skipping.")
+                continue
+                
             # Get predictions for the local set.
-            if len(local_set) > 0:
-                # Calculate gradients once for both detrimental dropping and selection
+            preds = self.train_softmax[local_set]
+            print(f"Epoch [{epoch}] [Greedy], initial pred shape: {np.shape(preds)}")
+            
+            # ----------------------------
+            # 4. Drop detrimental points from each local set
+            # ----------------------------
+            if self.args.drop_detrimental:
+                original_size = len(local_set)
+                
+                # This is where we identify and remove points that hurt training
+                filtered_local_set = self._drop_detrimental_data(epoch, training_step, local_set, preds)
+                
+                # Safety check - if we dropped all points, revert to original set
+                if len(filtered_local_set) == 0:
+                    self.args.logger.warning(
+                        f"All points were dropped as detrimental in set #{i}. Using original set."
+                    )
+                    filtered_local_set = orig_random_set.copy()
+                
+                # Update local set with the filtered version
+                local_set = filtered_local_set
+                
+                # Recompute predictions using the updated local_set.
                 preds = self.train_softmax[local_set]
-                print(f"Epoch [{epoch}] [Greedy], initial pred shape: {np.shape(preds)}")
+                print(f"Epoch [{epoch}] [Greedy], after detrimental drop: {len(local_set)}/{original_size} points remain")
+            
+            # Skip subset generation if local_set is empty
+            if len(local_set) == 0:
+                self.args.logger.warning(f"Empty filtered local set #{i} after detrimental dropping - skipping.")
+                continue
+
+            # ----------------------------
+            # 5. Calculate gradient features for submodular selection
+            # ----------------------------
+            # Calculate gradient approximation for the joint objective
+            if np.shape(preds)[-1] == self.args.num_classes:
+                one_hot_labels = np.eye(self.args.num_classes)[self.train_target[local_set]]
                 
-                # First apply detrimental dropping using the predictions
-                if self.args.drop_detrimental and len(local_set) > 0:
-                    original_size = len(local_set)
-                    # This is where we identify and remove points that hurt training
-                    local_set = self._drop_detrimental_data(epoch, training_step, local_set, preds)
-                    # Safety check - if we dropped all points,
-                    # revert to original set
-                    if len(local_set) == 0:
-                        self.args.logger.warning(
-                            f"All points were dropped as detrimental. Using original set."
-                        )
-                        local_set = orig_random_set.copy()
+                # Compute gradients as in CREST: g = softmax(logits) - one_hot(true_labels)
+                if one_hot_labels.shape == preds.shape:
+                    # This calculates the gradient of the cross-entropy loss with respect to the logits
+                    gradients = preds - one_hot_labels
+                else:
+                    self.args.logger.error(
+                        f"Shape mismatch: preds {preds.shape} vs one_hot {one_hot_labels.shape}. "
+                        f"Skipping gradient calculation."
+                    )
+                    gradients = preds  # Fall back to using softmax outputs if shape mismatch
+            
+                # ----------------------------
+                # 6. Apply the joint objective F(S) = f(S) + λD(S)
+                # ----------------------------
+                if hasattr(self.subset_generator, 'generate_mixed_subset'):
+                    # Cache label and softmax data to avoid repeated access
+                    local_labels = self.train_target[local_set]
+                    local_softmax = self.train_softmax[local_set]
                     
-                    # Recompute predictions using the updated local_set.
-                    preds = self.train_softmax[local_set]
-                    print(f"Epoch [{epoch}] [Greedy], after detrimental drop: {len(local_set)}/{original_size} points remain")
+                    # Features should be the computed gradients for theoretical alignment
+                    # Note: We reuse the gradients already computed above rather than recalculating
+                    features = gradients
+                    
+                    time_start = time.time()
+                    # This explicitly optimizes the joint objective from the theory
+                    subset_indices, weights = self.subset_generator.generate_mixed_subset(
+                        features=features,  # Gradient features for diversity kernel
+                        labels=local_labels,
+                        softmax_preds=local_softmax,
+                        subset_size=min(self.args.batch_size, len(local_set)),
+                        dpp_weight=self.args.dpp_weight,  # This is λ in F(S) = f(S) + λD(S)
+                        submod_weight=1.0 - self.args.dpp_weight,
+                        selection_method="mixed"
+                    )
+                    time_end = time.time()
+                    self.args.logger.info(f"generate_mixed_subset: {time_end - time_start:.2f} seconds")
+                    
+                    # Validate weights - ensure they're normalized and finite
+                    if len(weights) > 0:
+                        if not np.all(np.isfinite(weights)):
+                            self.args.logger.warning("Non-finite weights detected - normalizing")
+                            weights = np.ones_like(weights) / len(weights)
+                        elif np.abs(np.sum(weights) - 1.0) > 1e-5:
+                            self.args.logger.warning("Weights don't sum to 1.0 - normalizing")
+                            weights = weights / np.sum(weights)
+                        
+                    # Map to global indices
+                    subset = local_set[subset_indices]
+                    self.args.logger.info(f"Using joint DPP+coverage selection: {len(subset)} points selected")
+                    similarity_time = time_end - time_start  # Measure time for mixed selection
+                else:
+                    # Fall back to legacy selection method
+                    subset, weights, _, similarity_time = self.subset_generator.generate_subset(
+                        preds=gradients,  # Use computed gradients instead of preds
+                        epoch=epoch,
+                        B=min(self.args.batch_size, len(local_set)),  # Don't request more than available
+                        idx=local_set,
+                        targets=self.train_target,
+                        use_submodlib=(self.args.smtk == 0),
+                    )
                 
-                # Skip subset generation if local_set is empty
-                if len(local_set) > 0:
-                    # Calculate gradient approximation for the joint objective
-                    if np.shape(preds)[-1] == self.args.num_classes:
-                        one_hot_labels = np.eye(self.args.num_classes)[self.train_target[local_set]]
-                        
-                        # Compute gradients as in CREST: g = softmax(logits) - one_hot(true_labels)
-                        if one_hot_labels.shape == preds.shape:
-                            # This calculates the gradient of the cross-entropy loss with respect to the logits
-                            gradients = preds - one_hot_labels
-                        else:
-                            self.args.logger.error(
-                                f"Shape mismatch: preds {preds.shape} vs one_hot {one_hot_labels.shape}. "
-                                f"Skipping gradient calculation."
-                            )
-                            gradients = preds  # Fall back to using softmax outputs if shape mismatch
-                    
-                    # Apply the joint objective F(S) = f(S) + λD(S)
-                    if hasattr(self.subset_generator, 'generate_mixed_subset'):
-                        # Cache label and softmax data to avoid repeated access
-                        local_labels = self.train_target[local_set]
-                        local_softmax = self.train_softmax[local_set]
-                        
-                        # Features should be the computed gradients for theoretical alignment
-                        # Note: We reuse the gradients already computed above rather than recalculating
-                        features = gradients
-                        
-                        time_start = time.time()
-                        # This explicitly optimizes the joint objective from the theory
-                        subset_indices, weights = self.subset_generator.generate_mixed_subset(
-                            features=features,  # Gradient features for diversity kernel
-                            labels=local_labels,
-                            softmax_preds=local_softmax,
-                            subset_size=min(self.args.batch_size, len(local_set)),
-                            dpp_weight=self.args.dpp_weight,  # This is λ in F(S) = f(S) + λD(S)
-                            submod_weight=1.0 - self.args.dpp_weight,
-                            selection_method="mixed"
-                        )
-                        time_end = time.time()
-                        self.args.logger.info(f"generate_mixed_subset: {time_end - time_start:.2f} seconds")
-                        # Map to global indices
-                        subset = local_set[subset_indices]
-                        self.args.logger.info(f"Using joint DPP+coverage selection: {len(subset)} points selected")
-                        similarity_time = 0  # Not measured for this path
-                    else:
-                        # Fall back to legacy selection method
-                        subset, weights, _, similarity_time = self.subset_generator.generate_subset(
-                            preds=gradients,  # Use computed gradients instead of preds
-                            epoch=epoch,
-                            B=min(self.args.batch_size, len(local_set)),  # Don't request more than available
-                            idx=local_set,
-                            targets=self.train_target,
-                            use_submodlib=(self.args.smtk == 0),
-                        )
-                    
-                    self.similarity_time.update(similarity_time)
+                self.similarity_time.update(similarity_time)
+                
+                # Ensure we have valid subsets and weights
+                if len(subset) > 0:
                     processed_subsets.append(subset)
                     processed_weights.append(weights)
+                else:
+                    self.args.logger.warning(f"Empty selected subset in local set #{i}")
+            else:
+                self.args.logger.error(f"Invalid prediction shape: {np.shape(preds)}")
             
-            # Save the updated local set.
+            # Save the updated local set for overall statistics
             updated_random_sets.append(local_set)
         
+        # ----------------------------
+        # 7. Update global variables with combined results
+        # ----------------------------
         # Update global variables after processing, handle empty case
-        if updated_random_sets and any(len(rs) > 0 for rs in updated_random_sets):
-            self.random_sets = np.concatenate([rs for rs in updated_random_sets if len(rs) > 0])
+        if updated_random_sets:
+            self.random_sets = np.concatenate([rs for rs in updated_random_sets if len(rs) > 0]) if any(len(rs) > 0 for rs in updated_random_sets) else np.array([], dtype=int)
         else:
             self.random_sets = np.array([], dtype=int)
             
         if processed_subsets:
-            self.subset = np.concatenate(processed_subsets)
-            self.subset_weights = np.concatenate(processed_weights)
+            self.subset = np.concatenate(processed_subsets) if processed_subsets else np.array([], dtype=int)
+            self.subset_weights = np.concatenate(processed_weights) if processed_weights else np.array([], dtype=float)
+            
+            # Final safety check on weights
+            if len(self.subset_weights) > 0:
+                if not np.all(np.isfinite(self.subset_weights)):
+                    self.args.logger.warning("Final non-finite weights detected - normalizing")
+                    self.subset_weights = np.ones_like(self.subset_weights) / len(self.subset_weights)
+                elif np.abs(np.sum(self.subset_weights) - 1.0) > 1e-5:
+                    self.args.logger.warning(f"Final weights don't sum to 1.0 (sum={np.sum(self.subset_weights)}) - normalizing")
+                    self.subset_weights = self.subset_weights / np.sum(self.subset_weights)
         else:
             self.subset = np.array([], dtype=int)
             self.subset_weights = np.array([], dtype=float)
@@ -657,6 +707,10 @@ class CRESTTrainer(SubsetTrainer):
                 'epoch': epoch,
                 'training_step': training_step,
                 'final_subset_size': total_remaining,
-                'joint_dpp_applied': hasattr(self.subset_generator, 'generate_mixed_subset')
+                'joint_dpp_applied': hasattr(self.subset_generator, 'generate_mixed_subset'),
+                'random_sets_size': len(self.random_sets),
+                'local_sets_processed': len(processed_subsets)
             })
+            
+        return self.subset
 
