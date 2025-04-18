@@ -1,7 +1,7 @@
 from utils import Adahessian
 from datasets.subset import get_coreset
 from .subset_trainer import *
-from time import time
+import time
 
 
 class CRESTTrainer(SubsetTrainer):
