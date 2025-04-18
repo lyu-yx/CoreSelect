@@ -482,8 +482,9 @@ class CRESTTrainer(SubsetTrainer):
         """
 
         # ----------------------------
-        # 1. Select random subsets
+        # 1. Reset and select random subsets
         # ----------------------------
+        # Clear previous random sets to prevent growth over time
         self.random_sets = []
         self.subset = []
         self.subset_weights = []
@@ -503,18 +504,19 @@ class CRESTTrainer(SubsetTrainer):
             self.train_dataset.cache()
             
         # Generate stratified random subsets
+        random_sets_list = []  # Temporary list to store the random sets
         for _ in range(self.args.num_minibatch_coreset):
             # Select a random subset of global indices.
             random_subset = self._select_random_set()
-            self.random_sets.append(random_subset)
+            random_sets_list.append(random_subset)
             
-        # Combine all indices for global learned data dropping.
-        combined_random_sets = np.concatenate(self.random_sets)
+        # Store the original combined random sets for processing
+        combined_random_sets = np.concatenate(random_sets_list) if random_sets_list else np.array([], dtype=int)
         
         # ----------------------------
         # 2. Drop learned data points globally
         # ----------------------------
-        if self.args.drop_learned:
+        if self.args.drop_learned and len(combined_random_sets) > 0:
             # This updates self.train_indices based on loss values.
             time_start = time.time()
             self._drop_learned_data(epoch, training_step, combined_random_sets)
@@ -522,13 +524,13 @@ class CRESTTrainer(SubsetTrainer):
             self.args.logger.info(f"Dropping learned data: {time_end - time_start:.2f} seconds")
             
         # Filter each random set so they contain only indices in self.train_indices.
-        self.random_sets = [np.intersect1d(rs, self.train_indices) for rs in self.random_sets]
+        filtered_random_sets = [np.intersect1d(rs, self.train_indices) for rs in random_sets_list]
         
         # Update the DataLoader based on the filtered indices.
-        filtered_random_sets = np.concatenate([rs for rs in self.random_sets if len(rs) > 0]) if self.random_sets else np.array([])
-        if len(filtered_random_sets) > 0:
+        flat_filtered_random_sets = np.concatenate([rs for rs in filtered_random_sets if len(rs) > 0]) if filtered_random_sets else np.array([], dtype=int)
+        if len(flat_filtered_random_sets) > 0:
             self.train_val_loader = DataLoader(
-                Subset(self.train_dataset, indices=filtered_random_sets),
+                Subset(self.train_dataset, indices=flat_filtered_random_sets),
                 batch_size=self.args.batch_size,
                 shuffle=True,
                 num_workers=self.args.num_workers,
@@ -537,7 +539,7 @@ class CRESTTrainer(SubsetTrainer):
 
             time_start = time.time()
             # Only compute outputs for the filtered random sets, not the entire dataset
-            self._get_train_output(indices=filtered_random_sets)
+            self._get_train_output(indices=flat_filtered_random_sets)
             time_end = time.time()
             self.args.logger.info(f"_get_train_output: {time_end - time_start:.2f} seconds")
         else:
@@ -550,9 +552,9 @@ class CRESTTrainer(SubsetTrainer):
         processed_subsets = []
         processed_weights = []
         
-        for i, orig_random_set in enumerate(self.random_sets):
-            # Make a local copy so that we do not affect the global self.random_sets.
-            local_set = orig_random_set.copy()
+        for i, orig_random_set in enumerate(filtered_random_sets):
+            # Make a local copy so that we do not affect the global random sets.
+            local_set = orig_random_set.copy() if orig_random_set is not None else np.array([], dtype=int)
             
             # Skip processing if local_set is empty
             if len(local_set) == 0:
@@ -678,6 +680,7 @@ class CRESTTrainer(SubsetTrainer):
         # ----------------------------
         # Update global variables after processing, handle empty case
         if updated_random_sets:
+            # Store only the current random sets, don't append to previous iterations
             self.random_sets = np.concatenate([rs for rs in updated_random_sets if len(rs) > 0]) if any(len(rs) > 0 for rs in updated_random_sets) else np.array([], dtype=int)
         else:
             self.random_sets = np.array([], dtype=int)
