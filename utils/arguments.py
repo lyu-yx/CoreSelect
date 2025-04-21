@@ -105,7 +105,7 @@ def get_args():
     parser.add_argument('--dpp_schedule_factor', default=1.0, type=float, help='How quickly to increase diversity weight during training')
     parser.add_argument('--gradient_alignment_threshold', default=0.7, type=float, help='Threshold for gradient similarity that triggers diversity boost')
     parser.add_argument('--meta_lr', default=0.01, type=float, help='Learning rate for meta-optimization of lambda')
-    parser.add_argument('--per_class_lambda', default=True, type=parse_bool, const=True, nargs='?', help='Use per-class lambda parameters')
+    parser.add_argument('--per_class_lambda', default=False, type=parse_bool, const=True, nargs='?', help='Use per-class lambda parameters')
     
     # Spectral influence selection parameters (alternative to DPP)
     parser.add_argument('--selection_method', default="mixed", type=str, choices=['mixed', 'dpp', 'submod', 'spectral', 'trimodal', 'rand'], 

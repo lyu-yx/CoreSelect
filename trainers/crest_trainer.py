@@ -508,7 +508,7 @@ class CRESTTrainer(SubsetTrainer):
         # 1. Reset and select random subsets
         # ----------------------------
         # Clear previous random sets to prevent growth over time
-        self.random_sets = []
+        self.random_sets = np.array([], dtype=int)
         self.subset = []
         self.subset_weights = []
         

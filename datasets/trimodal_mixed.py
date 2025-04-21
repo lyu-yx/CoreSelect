@@ -2,6 +2,7 @@ import numpy as np
 from typing import Tuple, List, Dict, Optional
 import torch
 import time
+import scipy.spatial.distance
 from sklearn.metrics.pairwise import rbf_kernel
 
 def trimodal_mixed_selection(
