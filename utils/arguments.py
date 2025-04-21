@@ -37,8 +37,8 @@ def get_args():
         help="Saves checkpoints at every specified number of epochs")
     parser.add_argument("--gpu", type=int, nargs='+', default=[0])
 
-    parser.add_argument("--selection_method", default="crest", choices=['none', 'random', 'crest'],
-        help="subset selection method")
+    parser.add_argument("--trainer_type", default="crest", choices=['none', 'random', 'crest'],
+        help="Type of trainer to use (none=base, random=random selection, crest=core set selection)")
     parser.add_argument("--smtk", type=int, help="smtk", default=0)
     parser.add_argument("--train_frac", "-s", type=float, default=0.1, help="training fraction")
     parser.add_argument("--lr_milestones", type=int, nargs='+', default=[100,150])
@@ -88,8 +88,6 @@ def get_args():
     parser.add_argument('--min_train_size', default=40000, type=int)
     parser.add_argument('--min_batch_size', default=400, type=int)
     parser.add_argument('--generate_mixed_subset', default=True, type=bool, help='whether to generate a mixed subset')
-    parser.add_argument('--dpp_weight', default=0.5, type=float, help='DPP weight')
-
     # detrimental example dropping
     parser.add_argument('--drop_detrimental', default=True, type=parse_bool, const=True, nargs='?', help='drop detrimental examples')
     parser.add_argument('--cluster_thresh', default=1, type=int, help='cluster size threshold')
@@ -102,12 +100,31 @@ def get_args():
     parser.add_argument('--adaptive_dpp', default=False, type=parse_bool, const=True, nargs='?', help='Use adaptive DPP weights')
     parser.add_argument('--use_learnable_lambda', default=True, type=parse_bool, const=True, nargs='?', help='Use truly learnable lambda parameter')
     parser.add_argument('--dpp_weight', default=0.5, type=float, help='Base DPP weight when not using adaptive/learnable weighting')
-    parser.add_argument('--min_dpp_weight', default=0.1, type=float, help='Minimum DPP weight for adaptive/learnable weighting')
-    parser.add_argument('--max_dpp_weight', default=0.9, type=float, help='Maximum DPP weight for adaptive/learnable weighting')
+    parser.add_argument('--min_dpp_weight', default=0.2, type=float, help='Minimum DPP weight for adaptive/learnable weighting')
+    parser.add_argument('--max_dpp_weight', default=0.8, type=float, help='Maximum DPP weight for adaptive/learnable weighting')
     parser.add_argument('--dpp_schedule_factor', default=1.0, type=float, help='How quickly to increase diversity weight during training')
     parser.add_argument('--gradient_alignment_threshold', default=0.7, type=float, help='Threshold for gradient similarity that triggers diversity boost')
     parser.add_argument('--meta_lr', default=0.01, type=float, help='Learning rate for meta-optimization of lambda')
     parser.add_argument('--per_class_lambda', default=True, type=parse_bool, const=True, nargs='?', help='Use per-class lambda parameters')
+    
+    # Spectral influence selection parameters (alternative to DPP)
+    parser.add_argument('--selection_method', default="mixed", type=str, choices=['mixed', 'dpp', 'submod', 'spectral', 'trimodal', 'rand'], 
+                       help='Method to use for subset selection (mixed=DPP+coverage, spectral=non-DPP alternative, trimodal=combines all three approaches)')
+    parser.add_argument('--n_clusters_factor', default=0.1, type=float, 
+                       help='Factor to determine number of clusters as fraction of subset size (for spectral method)')
+    parser.add_argument('--influence_type', default="gradient_norm", type=str, 
+                       choices=['gradient_norm', 'loss', 'uncertainty'], 
+                       help='Method to compute influence scores (for spectral method)')
+    parser.add_argument('--balance_clusters', default=True, type=parse_bool, const=True, nargs='?',
+                       help='Whether to enforce balanced selection across clusters (for spectral method)')
+    parser.add_argument('--affinity_metric', default="rbf", type=str, choices=['rbf', 'cosine'], 
+                       help='Metric for computing the affinity matrix (for spectral method)')
+    
+    # Trimodal weight parameters
+    parser.add_argument('--spectral_weight', default=0.33, type=float,
+                      help='Weight allocated to spectral influence selection in trimodal method (0-1)')
+    parser.add_argument('--dpp_submod_ratio', default=0.5, type=float,
+                      help='Ratio between DPP and Submodular in remaining budget after spectral (0=all submod, 1=all DPP)')
 
     # others
     parser.add_argument('--use_wandb', default=False, type=parse_bool, const=True, nargs='?')

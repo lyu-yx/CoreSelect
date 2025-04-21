@@ -80,7 +80,9 @@ class LearnableLambda:
     def _transform(self, raw_value):
         """Convert from unbounded optimization space to [min_value, max_value] range"""
         # Using sigmoid transformation: 1/(1+e^(-x))
-        sigmoid = 1.0 / (1.0 + torch.exp(-raw_value))
+        # Clip raw values for numerical stability
+        clipped_raw = torch.clamp(raw_value, -10.0, 10.0) 
+        sigmoid = 1.0 / (1.0 + torch.exp(-clipped_raw))
         return self.min_value + sigmoid * (self.max_value - self.min_value)
     
     def get_value(self, class_idx=None, epoch=None):
@@ -110,6 +112,12 @@ class LearnableLambda:
         
         # Cache for later use
         if epoch is not None:
+            # Maintain a reasonable cache size - clear old entries if needed
+            if len(self.cached_values) > 1000:  # Arbitrary threshold
+                # Keep only the most recent epoch's values
+                current_epoch_keys = [k for k in self.cached_values.keys() if k[0] == epoch]
+                self.cached_values = {k: self.cached_values[k] for k in current_epoch_keys}
+            
             self.cached_values[cache_key] = transformed
             self.cached_epoch = epoch
             

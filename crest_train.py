@@ -85,7 +85,7 @@ def main(args):
     else:
         raise NotImplementedError(f"Architecture {args.arch} not implemented.")
 
-    if args.selection_method == "none":
+    if args.trainer_type == "none":
         from trainers import BaseTrainer
         trainer = BaseTrainer(
             args,
@@ -93,7 +93,7 @@ def main(args):
             train_dataset,
             val_loader,
         )
-    elif args.selection_method == "random":
+    elif args.trainer_type == "random":
         from trainers import RandomTrainer
         trainer = RandomTrainer(
             args,
@@ -101,7 +101,7 @@ def main(args):
             train_dataset,
             val_loader,
         )
-    elif args.selection_method == "crest":
+    elif args.trainer_type == "crest":
         from trainers import CRESTTrainer
         trainer = CRESTTrainer(
             args,
@@ -110,7 +110,7 @@ def main(args):
             val_loader,
         )
     else:
-        raise NotImplementedError(f"Selection method {args.selection_method} not implemented.")
+        raise NotImplementedError(f"Trainer type {args.trainer_type} not implemented.")
     
     trainer.train()
 

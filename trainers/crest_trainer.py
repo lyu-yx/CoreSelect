@@ -1,4 +1,5 @@
 from utils import Adahessian
+from utils.learnable_lambda import LearnableLambda
 from datasets.subset import get_coreset
 from .subset_trainer import *
 import time
@@ -634,7 +635,7 @@ class CRESTTrainer(SubsetTrainer):
                     gradients = preds  # Fall back to using softmax outputs if shape mismatch
             
                 # ----------------------------
-                # 6. Apply the joint objective F(S) = f(S) + λD(S)
+                # 6. Apply the joint objective F(S) = f(S) + λD(S) or the spectral-influence alternative
                 # ----------------------------
                 if hasattr(self.subset_generator, 'generate_mixed_subset'):
                     # Cache label and softmax data to avoid repeated access
@@ -645,90 +646,119 @@ class CRESTTrainer(SubsetTrainer):
                     # Note: We reuse the gradients already computed above rather than recalculating
                     features = gradients
                     
-                    # Get the learnable lambda parameter (dpp_weight)
-                    if self.use_learnable_lambda:
-                        # Get class-specific lambda values if multiple classes
-                        unique_classes = np.unique(local_labels)
-                        lambda_values = []
+                    # Determine which selection method to use
+                    selection_method = getattr(self.args, 'selection_method', 'mixed')
+                    
+                    # For spectral method, use the command-line parameters
+                    if selection_method == 'spectral':
+                        self.args.logger.info(f"Using spectral influence selection method")
                         
-                        # Get lambda for each class represented in the batch
-                        for cls in unique_classes:
-                            lambda_val = self.learnable_lambda.get_value(class_idx=cls, epoch=epoch)
-                            lambda_values.append(lambda_val)
-                            
-                        # Use the mean lambda value for this subset
-                        dpp_weight = np.mean(lambda_values)
-                        submod_weight = 1.0 - dpp_weight
+                        # Call the spectral influence selection method
+                        subset_indices, weights = self.subset_generator.generate_spectral_influence_subset(
+                            features=features,
+                            labels=local_labels,
+                            softmax_preds=local_softmax,
+                            subset_size=min(self.args.batch_size, len(local_set)),
+                            n_clusters_factor=getattr(self.args, 'n_clusters_factor', 0.1),
+                            influence_type=getattr(self.args, 'influence_type', 'gradient_norm'),
+                            balance_clusters=getattr(self.args, 'balance_clusters', True),
+                            affinity_metric=getattr(self.args, 'affinity_metric', 'rbf'),
+                            true_gradients=features  # Use the gradients we already computed
+                        )
                         
-                        # Log the learned lambda value with detailed metrics
-                        if self.args.use_wandb:
-                            self.learnable_lambda.log_to_wandb(epoch, {
-                                'training_step': training_step,
-                                'lambda_applied': dpp_weight,
-                                'num_classes_in_batch': len(unique_classes),
-                            })
-                        
-                        self.args.logger.info(f"Using learnable lambda: {dpp_weight:.4f} for selection")
-                    else:
-                        # Fallback to adaptive weighting
-                        unique_classes = np.unique(local_labels)
-                        adaptive_weights = []
-                        
-                        # If we have a single class, calculate one weight
-                        if len(unique_classes) == 1:
-                            adaptive_dpp_weight = self._calculate_adaptive_dpp_weight(
-                                epoch=epoch, 
-                                class_idx=unique_classes[0], 
-                                gradients=features
-                            )
-                            adaptive_weights = [adaptive_dpp_weight]
-                        else:
-                            # For multi-class subsets, calculate per-class weights and average them
-                            for cls in unique_classes:
-                                # Get indices for this class
-                                cls_indices = np.where(local_labels == cls)[0]
-                                if len(cls_indices) < 2:  # Need at least 2 samples to compute similarity
-                                    class_weight = self._calculate_adaptive_dpp_weight(epoch=epoch, class_idx=cls)
-                                else:
-                                    # Calculate using class-specific gradients
-                                    class_weight = self._calculate_adaptive_dpp_weight(
-                                        epoch=epoch,
-                                        class_idx=cls,
-                                        gradients=features[cls_indices]
-                                    )
-                                adaptive_weights.append(class_weight)
-                        
-                        # Take average of class-specific weights
-                        dpp_weight = np.mean(adaptive_weights) if adaptive_weights else self.base_dpp_weight
-                        submod_weight = 1.0 - dpp_weight
-                        
-                        self.args.logger.info(f"Using adaptive DPP weight: {dpp_weight:.4f} for selection")
-                        
-                        # Log the adaptive weight details
+                        # Log details about the selection
                         if self.args.use_wandb:
                             wandb.log({
                                 'epoch': epoch,
                                 'training_step': training_step,
-                                'adaptive_dpp_weight_applied': dpp_weight,
-                                'num_classes_in_batch': len(unique_classes),
-                                'min_class_weight': min(adaptive_weights) if adaptive_weights else 0,
-                                'max_class_weight': max(adaptive_weights) if adaptive_weights else 0
+                                'spectral_selection_used': True,
+                                'influence_type': getattr(self.args, 'influence_type', 'gradient_norm'),
+                                'n_clusters_factor': getattr(self.args, 'n_clusters_factor', 0.1),
+                                'num_selected': len(subset_indices)
                             })
+                    else:
+                        # For other methods (mixed, dpp, submod, rand), get the dpp_weight parameter first
+                        if self.use_learnable_lambda:
+                            # Get class-specific lambda values if multiple classes
+                            unique_classes = np.unique(local_labels)
+                            lambda_values = []
+                            
+                            # Get lambda for each class represented in the batch
+                            for cls in unique_classes:
+                                lambda_val = self.learnable_lambda.get_value(class_idx=cls, epoch=epoch)
+                                lambda_values.append(lambda_val)
+                                
+                            # Use the mean lambda value for this subset
+                            dpp_weight = np.mean(lambda_values)
+                            submod_weight = 1.0 - dpp_weight
+                            
+                            # Log the learned lambda value with detailed metrics
+                            if self.args.use_wandb:
+                                self.learnable_lambda.log_to_wandb(epoch, {
+                                    'training_step': training_step,
+                                    'lambda_applied': dpp_weight,
+                                    'num_classes_in_batch': len(unique_classes),
+                                })
+                            
+                            self.args.logger.info(f"Using learnable lambda: {dpp_weight:.4f} for selection")
+                        else:
+                            # Fallback to adaptive weighting
+                            unique_classes = np.unique(local_labels)
+                            adaptive_weights = []
+                            
+                            # If we have a single class, calculate one weight
+                            if len(unique_classes) == 1:
+                                adaptive_dpp_weight = self._calculate_adaptive_dpp_weight(
+                                    epoch=epoch, 
+                                    class_idx=unique_classes[0], 
+                                    gradients=features
+                                )
+                                adaptive_weights = [adaptive_dpp_weight]
+                            else:
+                                # For multi-class subsets, calculate per-class weights and average them
+                                for cls in unique_classes:
+                                    # Get indices for this class
+                                    cls_indices = np.where(local_labels == cls)[0]
+                                    if len(cls_indices) < 2:  # Need at least 2 samples to compute similarity
+                                        class_weight = self._calculate_adaptive_dpp_weight(epoch=epoch, class_idx=cls)
+                                    else:
+                                        # Calculate using class-specific gradients
+                                        class_weight = self._calculate_adaptive_dpp_weight(
+                                            epoch=epoch,
+                                            class_idx=cls,
+                                            gradients=features[cls_indices]
+                                        )
+                                    adaptive_weights.append(class_weight)
+                            
+                            # Take average of class-specific weights
+                            dpp_weight = np.mean(adaptive_weights) if adaptive_weights else self.base_dpp_weight
+                            submod_weight = 1.0 - dpp_weight
+                            
+                            self.args.logger.info(f"Using adaptive DPP weight: {dpp_weight:.4f} for selection")
+                            
+                            # Log the adaptive weight details
+                            if self.args.use_wandb:
+                                wandb.log({
+                                    'epoch': epoch,
+                                    'training_step': training_step,
+                                    'adaptive_dpp_weight_applied': dpp_weight,
+                                    'num_classes_in_batch': len(unique_classes),
+                                    'min_class_weight': min(adaptive_weights) if adaptive_weights else 0,
+                                    'max_class_weight': max(adaptive_weights) if adaptive_weights else 0
+                                })
+                        
+                        # Call the mixed subset generation with the appropriate selection method and weights
+                        subset_indices, weights = self.subset_generator.generate_mixed_subset(
+                            features=features,  # Gradient features for diversity kernel
+                            labels=local_labels,
+                            softmax_preds=local_softmax,
+                            subset_size=min(self.args.batch_size, len(local_set)),
+                            dpp_weight=dpp_weight,  # Learnable or adaptive λ 
+                            submod_weight=submod_weight,
+                            selection_method=selection_method  # Use the specified selection method
+                        )
                     
-                    time_start = time.time()
-                    # This explicitly optimizes the joint objective with dynamic λ
-                    subset_indices, weights = self.subset_generator.generate_mixed_subset(
-                        features=features,  # Gradient features for diversity kernel
-                        labels=local_labels,
-                        softmax_preds=local_softmax,
-                        subset_size=min(self.args.batch_size, len(local_set)),
-                        dpp_weight=dpp_weight,  # Learnable or adaptive λ 
-                        submod_weight=submod_weight,
-                        selection_method="mixed"
-                    )
-                    time_end = time.time()
-                    self.args.logger.info(f"generate_mixed_subset: {time_end - time_start:.2f} seconds")
-                    
+                    # The rest of the validation and processing remains the same regardless of selection method
                     # Validate weights - ensure they're normalized and finite
                     if len(weights) > 0:
                         if not np.all(np.isfinite(weights)):
@@ -740,8 +770,8 @@ class CRESTTrainer(SubsetTrainer):
                         
                     # Map to global indices
                     subset = local_set[subset_indices]
-                    self.args.logger.info(f"Using joint DPP+coverage selection: {len(subset)} points selected")
-                    similarity_time = time_end - time_start  # Measure time for mixed selection
+                    self.args.logger.info(f"Selection method '{selection_method}' selected {len(subset)} points")
+                    similarity_time = time.time() - time_start  # Measure time for selection
                 else:
                     # Fall back to legacy selection method
                     subset, weights, _, similarity_time = self.subset_generator.generate_subset(

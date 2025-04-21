@@ -20,6 +20,16 @@ class SubsetGenerator:
         self.greedy = greedy
         self.smtk = smtk
         
+        # Parameters for the spectral influence selector
+        self.n_clusters_factor = 0.1
+        self.influence_type = "gradient_norm"
+        self.balance_clusters = True
+        self.affinity_metric = "rbf"
+        
+        # Parameters for trimodal selection
+        self.spectral_weight = 0.33  # Weight for spectral component
+        self.dpp_submod_ratio = 0.5  # Equal weighting between DPP and submodular by default
+        
     def generate_mixed_subset(
         self,
         features: np.ndarray,
@@ -31,8 +41,7 @@ class SubsetGenerator:
         selection_method: str = "mixed"
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Generate a subset using a combination of DPP and submodular methods
-        for better coverage and diversity.
+        Generate a subset using a combination of methods for better coverage and diversity.
         
         Following the theory:
         F(S) = f(S) + λD(S)
@@ -45,7 +54,7 @@ class SubsetGenerator:
             subset_size: Size of the subset to select
             dpp_weight: Weight for DPP selection component (λ in the theory)
             submod_weight: Weight for submodular selection component
-            selection_method: Method for selection ("mixed", "dpp", "submod", "rand")
+            selection_method: Method for selection ("mixed", "dpp", "submod", "spectral", "trimodal", "rand")
             
         Returns:
             Tuple of (selected indices, weights for the selected samples)
@@ -64,6 +73,53 @@ class SubsetGenerator:
         elif selection_method == "submod":
             # Pure submodular selection for coverage
             indices, weights = self._submodular_selection(features, labels, softmax_preds, subset_size)
+            return indices, weights
+            
+        elif selection_method == "spectral":
+            # Spectral clustering with influence functions (non-DPP approach)
+            indices, weights = self.generate_spectral_influence_subset(
+                features=features,
+                labels=labels,
+                softmax_preds=softmax_preds,
+                subset_size=subset_size
+            )
+            return indices, weights
+            
+        elif selection_method == "trimodal":
+            # Use the new trimodal mixed selection method
+            from datasets.trimodal_mixed import trimodal_mixed_selection
+            
+            # Use approximately 1/3 of budget for each method
+            spectral_weight = getattr(self, 'spectral_weight', 0.33)
+            
+            # If we have a DPP weight, distribute remaining weight between DPP and submod
+            # based on the specified dpp_weight ratio
+            remaining_weight = 1.0 - spectral_weight
+            actual_dpp_weight = remaining_weight * dpp_weight / (dpp_weight + submod_weight)
+            actual_submod_weight = remaining_weight * submod_weight / (dpp_weight + submod_weight)
+            
+            # Timing for performance evaluation
+            time_start = time.time()
+            
+            # Call the trimodal selection method
+            indices, weights = trimodal_mixed_selection(
+                features=features,
+                labels=labels,
+                softmax_preds=softmax_preds,
+                subset_size=subset_size,
+                dpp_weight=actual_dpp_weight,
+                submod_weight=actual_submod_weight,
+                spectral_weight=spectral_weight,
+                n_clusters_factor=getattr(self, 'n_clusters_factor', 0.1),
+                influence_type=getattr(self, 'influence_type', 'gradient_norm'),
+                balance_clusters=getattr(self, 'balance_clusters', True),
+                affinity_metric=getattr(self, 'affinity_metric', 'rbf'),
+                random_state=42
+            )
+            
+            selection_time = time.time() - time_start
+            print(f"Trimodal mixed selection completed in {selection_time:.2f} seconds")
+            
             return indices, weights
             
         else:  # "mixed" or default - this is the joint objective approach
@@ -699,6 +755,64 @@ class SubsetGenerator:
             weights = np.array([], dtype=float)
                 
         return indices, weights
+
+    def generate_spectral_influence_subset(
+        self,
+        features: np.ndarray,
+        labels: np.ndarray,
+        softmax_preds: np.ndarray,
+        subset_size: int,
+        n_clusters_factor: float = 0.1,
+        influence_type: str = "gradient_norm",
+        balance_clusters: bool = True,
+        affinity_metric: str = "rbf",
+        true_gradients: Optional[np.ndarray] = None
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Generate a diverse and representative subset using spectral clustering and influence functions.
+        
+        This approach is an alternative to DPP-based selection that directly leverages the manifold
+        structure of the data through spectral clustering, and prioritizes influential samples.
+        
+        Args:
+            features: Feature representations of samples (e.g., embeddings or gradients)
+            labels: Class labels for the samples
+            softmax_preds: Model's predictions (e.g., softmax outputs)
+            subset_size: Size of the subset to select
+            n_clusters_factor: Factor to determine number of clusters
+            influence_type: Method to compute influence scores
+            balance_clusters: Whether to enforce balanced selection across clusters
+            affinity_metric: Metric for computing the affinity matrix
+            true_gradients: Pre-computed gradients if available (optional)
+            
+        Returns:
+            Tuple of (selected indices, selection weights)
+        """
+        # Import our spectral influence selector
+        from datasets.spectral_influence import SpectralInfluenceSelector
+        
+        # Create the selector
+        selector = SpectralInfluenceSelector(
+            n_clusters_factor=n_clusters_factor,
+            influence_type=influence_type,
+            balance_clusters=balance_clusters,
+            affinity_metric=affinity_metric
+        )
+        
+        # Use it to generate a subset
+        start_time = time.time()
+        selected_indices, weights = selector.generate_subset(
+            features=features,
+            labels=labels,
+            model_outputs=softmax_preds,
+            subset_size=subset_size,
+            true_gradients=true_gradients
+        )
+        selection_time = time.time() - start_time
+        
+        print(f"Spectral influence selection completed in {selection_time:.2f} seconds")
+        
+        return selected_indices, weights
 
     def generate_subset(
         self,

@@ -1,2 +1,4 @@
 from .indexed_dataset import IndexedDataset
 from .subset_generator import SubsetGenerator
+from .spectral_influence import SpectralInfluenceSelector
+from .trimodal_mixed import trimodal_mixed_selection
