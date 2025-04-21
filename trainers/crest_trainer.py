@@ -28,6 +28,28 @@ class CRESTTrainer(SubsetTrainer):
         self.approx_time = AverageMeter()
         self.compare_time = AverageMeter()
         self.similarity_time = AverageMeter()
+        
+        # Initialize learnable lambda parameter for DPP weight
+        self.use_learnable_lambda = getattr(self.args, 'use_learnable_lambda', True)
+        if self.use_learnable_lambda:
+            self.learnable_lambda = LearnableLambda(
+                num_classes=self.args.num_classes,
+                initial_value=getattr(self.args, 'dpp_weight', 0.5),
+                min_value=getattr(self.args, 'min_dpp_weight', 0.2),
+                max_value=getattr(self.args, 'max_dpp_weight', 0.8),
+                meta_lr=getattr(self.args, 'meta_lr', 0.01),
+                use_per_class=getattr(self.args, 'per_class_lambda', True),
+                device=self.args.device
+            )
+            self.args.logger.info(f"Using learnable lambda for DPP weight")
+        else:
+            # Initialize adaptive DPP weights tracking (fallback to previous implementation)
+            self.adaptive_dpp_weights = {}  # Class-specific adaptive weights
+            self.base_dpp_weight = getattr(self.args, 'dpp_weight', 0.5)  # Default to 0.5 if not specified
+            self.max_dpp_weight = getattr(self.args, 'max_dpp_weight', 0.8)  # Maximum diversity weight
+            self.min_dpp_weight = getattr(self.args, 'min_dpp_weight', 0.2)  # Minimum diversity weight
+            self.dpp_schedule_factor = getattr(self.args, 'dpp_schedule_factor', 1.0)  # How quickly to ramp up diversity
+            self.gradient_alignment_threshold = getattr(self.args, 'gradient_alignment_threshold', 0.7)  # Threshold for gradient alignment
 
     def _train_epoch(self, epoch: int):
         """
@@ -623,15 +645,85 @@ class CRESTTrainer(SubsetTrainer):
                     # Note: We reuse the gradients already computed above rather than recalculating
                     features = gradients
                     
+                    # Get the learnable lambda parameter (dpp_weight)
+                    if self.use_learnable_lambda:
+                        # Get class-specific lambda values if multiple classes
+                        unique_classes = np.unique(local_labels)
+                        lambda_values = []
+                        
+                        # Get lambda for each class represented in the batch
+                        for cls in unique_classes:
+                            lambda_val = self.learnable_lambda.get_value(class_idx=cls, epoch=epoch)
+                            lambda_values.append(lambda_val)
+                            
+                        # Use the mean lambda value for this subset
+                        dpp_weight = np.mean(lambda_values)
+                        submod_weight = 1.0 - dpp_weight
+                        
+                        # Log the learned lambda value with detailed metrics
+                        if self.args.use_wandb:
+                            self.learnable_lambda.log_to_wandb(epoch, {
+                                'training_step': training_step,
+                                'lambda_applied': dpp_weight,
+                                'num_classes_in_batch': len(unique_classes),
+                            })
+                        
+                        self.args.logger.info(f"Using learnable lambda: {dpp_weight:.4f} for selection")
+                    else:
+                        # Fallback to adaptive weighting
+                        unique_classes = np.unique(local_labels)
+                        adaptive_weights = []
+                        
+                        # If we have a single class, calculate one weight
+                        if len(unique_classes) == 1:
+                            adaptive_dpp_weight = self._calculate_adaptive_dpp_weight(
+                                epoch=epoch, 
+                                class_idx=unique_classes[0], 
+                                gradients=features
+                            )
+                            adaptive_weights = [adaptive_dpp_weight]
+                        else:
+                            # For multi-class subsets, calculate per-class weights and average them
+                            for cls in unique_classes:
+                                # Get indices for this class
+                                cls_indices = np.where(local_labels == cls)[0]
+                                if len(cls_indices) < 2:  # Need at least 2 samples to compute similarity
+                                    class_weight = self._calculate_adaptive_dpp_weight(epoch=epoch, class_idx=cls)
+                                else:
+                                    # Calculate using class-specific gradients
+                                    class_weight = self._calculate_adaptive_dpp_weight(
+                                        epoch=epoch,
+                                        class_idx=cls,
+                                        gradients=features[cls_indices]
+                                    )
+                                adaptive_weights.append(class_weight)
+                        
+                        # Take average of class-specific weights
+                        dpp_weight = np.mean(adaptive_weights) if adaptive_weights else self.base_dpp_weight
+                        submod_weight = 1.0 - dpp_weight
+                        
+                        self.args.logger.info(f"Using adaptive DPP weight: {dpp_weight:.4f} for selection")
+                        
+                        # Log the adaptive weight details
+                        if self.args.use_wandb:
+                            wandb.log({
+                                'epoch': epoch,
+                                'training_step': training_step,
+                                'adaptive_dpp_weight_applied': dpp_weight,
+                                'num_classes_in_batch': len(unique_classes),
+                                'min_class_weight': min(adaptive_weights) if adaptive_weights else 0,
+                                'max_class_weight': max(adaptive_weights) if adaptive_weights else 0
+                            })
+                    
                     time_start = time.time()
-                    # This explicitly optimizes the joint objective from the theory
+                    # This explicitly optimizes the joint objective with dynamic λ
                     subset_indices, weights = self.subset_generator.generate_mixed_subset(
                         features=features,  # Gradient features for diversity kernel
                         labels=local_labels,
                         softmax_preds=local_softmax,
                         subset_size=min(self.args.batch_size, len(local_set)),
-                        dpp_weight=self.args.dpp_weight,  # This is λ in F(S) = f(S) + λD(S)
-                        submod_weight=1.0 - self.args.dpp_weight,
+                        dpp_weight=dpp_weight,  # Learnable or adaptive λ 
+                        submod_weight=submod_weight,
                         selection_method="mixed"
                     )
                     time_end = time.time()
@@ -716,4 +808,120 @@ class CRESTTrainer(SubsetTrainer):
             })
             
         return self.subset
+
+    def _calculate_adaptive_dpp_weight(self, epoch: int, class_idx: int = None, gradients=None):
+        """
+        Calculate an adaptive DPP weight that changes based on:
+        1. Training progression (increase diversity as training progresses)
+        2. Class-specific properties (clusters within classes)
+        3. Gradient alignment (increase diversity when gradients become more aligned)
+        
+        :param epoch: Current training epoch
+        :param class_idx: Optional class index for class-specific adaptation
+        :param gradients: Optional gradient features for alignment-based adaptation
+        :return: Adapted DPP weight value between min_dpp_weight and max_dpp_weight
+        """
+        # Initialize with the base weight
+        adaptive_weight = self.base_dpp_weight
+        
+        # Factor 1: Training progression - increase diversity weight over time
+        if hasattr(self.args, 'epochs'):
+            # Normalize epoch to range [0, 1] based on training schedule
+            normalized_epoch = min(1.0, epoch / (self.args.epochs * 0.8))  # Reach max at 80% of training
+            
+            # Apply sigmoid-like scaling to make transition smoother
+            progression_factor = 1.0 / (1.0 + np.exp(-10 * (normalized_epoch - 0.5)))
+            
+            # Scale with configurable rate of change
+            progression_factor *= self.dpp_schedule_factor
+            
+            # Use progression to shift weight toward max_dpp_weight
+            adaptive_weight = self.min_dpp_weight + progression_factor * (self.max_dpp_weight - self.min_dpp_weight)
+        
+        # Factor 2: Class-specific adjustments for cluster density
+        if class_idx is not None and class_idx in self.adaptive_dpp_weights:
+            # Use cached value from previous calculations for this class
+            class_adjustment = self.adaptive_dpp_weights[class_idx]
+            adaptive_weight = 0.7 * adaptive_weight + 0.3 * class_adjustment
+        
+        # Factor 3: Gradient alignment analysis 
+        if gradients is not None and len(gradients) > 1:
+            try:
+                # Calculate pairwise cosine similarity of gradient vectors
+                normalized_grads = gradients / (np.linalg.norm(gradients, axis=1, keepdims=True) + 1e-8)
+                similarities = np.dot(normalized_grads, normalized_grads.T)
+                
+                # Calculate average similarity (higher means more alignment)
+                upper_tri = np.triu_indices_from(similarities, k=1)
+                avg_similarity = np.mean(similarities[upper_tri])
+                
+                # Apply adaptive weight based on similarity
+                # When gradients are highly aligned (avg_similarity close to 1), 
+                # we need more diversity to explore different directions
+                if avg_similarity > self.gradient_alignment_threshold:
+                    alignment_factor = (avg_similarity - self.gradient_alignment_threshold) / (1.0 - self.gradient_alignment_threshold)
+                    alignment_boost = alignment_factor * 0.3  # Max 30% boost from alignment
+                    adaptive_weight = min(self.max_dpp_weight, adaptive_weight + alignment_boost)
+                    
+                    # Cache this value for this class if specified
+                    if class_idx is not None:
+                        self.adaptive_dpp_weights[class_idx] = adaptive_weight
+            except Exception as e:
+                self.args.logger.warning(f"Error calculating gradient similarity: {e}")
+        
+        # Ensure weight stays within bounds
+        adaptive_weight = max(self.min_dpp_weight, min(self.max_dpp_weight, adaptive_weight))
+        
+        # Log the calculated weight if using wandb
+        if self.args.use_wandb:
+            log_data = {
+                'adaptive_dpp_weight': adaptive_weight,
+                'class_idx': class_idx if class_idx is not None else -1,
+                'epoch': epoch
+            }
+            # Add component factors if they were calculated
+            if 'normalized_epoch' in locals():
+                log_data['dpp_progression_factor'] = progression_factor
+            if 'avg_similarity' in locals():
+                log_data['gradient_similarity'] = avg_similarity
+                
+            wandb.log(log_data)
+            
+        return adaptive_weight
+
+    def _eval_epoch(self, epoch: int):
+        """
+        Evaluate the model on the validation set and update learnable lambda
+        """
+        result = super()._eval_epoch(epoch)
+        
+        # Update learnable lambda parameter based on training and validation performance
+        if self.use_learnable_lambda and epoch > 0:
+            # Get training and validation performance metrics
+            train_acc = self.train_acc.avg
+            val_acc = result['val_acc']
+            
+            # Update the learnable lambda parameter
+            self.learnable_lambda.update_with_performance(train_acc, val_acc, epoch)
+            
+            # Log detailed lambda information to wandb
+            if self.args.use_wandb:
+                self.learnable_lambda.log_to_wandb(epoch, {
+                    'train_acc': train_acc,
+                    'val_acc': val_acc,
+                    'train_loss': self.train_loss.avg,
+                    'val_loss': result['val_loss']
+                })
+                
+            # Log the current lambda values
+            lambda_values = self.learnable_lambda.get_all_values()
+            if len(lambda_values) > 1:
+                # Per-class lambdas
+                lambda_str = ", ".join([f"Class {i}: {val:.3f}" for i, val in enumerate(lambda_values)])
+                self.args.logger.info(f"Epoch {epoch} - Learnable lambda values: {lambda_str}")
+            else:
+                # Global lambda
+                self.args.logger.info(f"Epoch {epoch} - Learnable lambda value: {lambda_values[0]:.3f}")
+        
+        return result
 

@@ -97,6 +97,17 @@ def get_args():
     parser.add_argument('--target_drop_percentage', default=0, type=int, help='Further drop after cluster_thresh drop.')
     parser.add_argument('--drop_after', default=0, type=int, help='epoch to start dropping detrimental examples')
     parser.add_argument('--optimizer', default="LazyGreedy", type=str, help='optimizer for detrimental instance dropping')
+    
+    # DPP adaptive weight parameters
+    parser.add_argument('--adaptive_dpp', default=False, type=parse_bool, const=True, nargs='?', help='Use adaptive DPP weights')
+    parser.add_argument('--use_learnable_lambda', default=True, type=parse_bool, const=True, nargs='?', help='Use truly learnable lambda parameter')
+    parser.add_argument('--dpp_weight', default=0.5, type=float, help='Base DPP weight when not using adaptive/learnable weighting')
+    parser.add_argument('--min_dpp_weight', default=0.1, type=float, help='Minimum DPP weight for adaptive/learnable weighting')
+    parser.add_argument('--max_dpp_weight', default=0.9, type=float, help='Maximum DPP weight for adaptive/learnable weighting')
+    parser.add_argument('--dpp_schedule_factor', default=1.0, type=float, help='How quickly to increase diversity weight during training')
+    parser.add_argument('--gradient_alignment_threshold', default=0.7, type=float, help='Threshold for gradient similarity that triggers diversity boost')
+    parser.add_argument('--meta_lr', default=0.01, type=float, help='Learning rate for meta-optimization of lambda')
+    parser.add_argument('--per_class_lambda', default=True, type=parse_bool, const=True, nargs='?', help='Use per-class lambda parameters')
 
     # others
     parser.add_argument('--use_wandb', default=False, type=parse_bool, const=True, nargs='?')
