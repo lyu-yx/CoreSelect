@@ -45,7 +45,7 @@ def get_args():
     parser.add_argument("--gamma", type=float, default=0.1, help="learning rate decay parameter")
     parser.add_argument('--seed', default=0, type=int, help="random seed")
     parser.add_argument("--runs", type=int, help="num runs", default=1)
-    parser.add_argument("--warm_start_epochs", default=20, type=int, help="epochs to warm start learning rate")
+    parser.add_argument("--warm_start_epochs", default=1, type=int, help="epochs to warm start learning rate") # to 20
     parser.add_argument("--subset_start_epoch", default=0, type=int, help="epoch to start subset selection")
 
     # data augmentation options
@@ -87,9 +87,9 @@ def get_args():
     parser.add_argument('--drop_thresh', default=0.1, type=float, help='loss threshold')
     parser.add_argument('--min_train_size', default=40000, type=int)
     parser.add_argument('--min_batch_size', default=400, type=int)
-    parser.add_argument('--generate_mixed_subset', default=True, type=bool, help='whether to generate a mixed subset')
+
     # detrimental example dropping
-    parser.add_argument('--drop_detrimental', default=True, type=parse_bool, const=True, nargs='?', help='drop detrimental examples')
+    parser.add_argument('--drop_detrimental', default=False, type=parse_bool, const=True, nargs='?', help='drop detrimental examples')
     parser.add_argument('--cluster_thresh', default=1, type=int, help='cluster size threshold')
     parser.add_argument('--detrimental_cluster_num', default=64, type=int, help='Number of clusters to create.')
     parser.add_argument('--target_drop_percentage', default=0, type=int, help='Further drop after cluster_thresh drop.')
@@ -97,6 +97,7 @@ def get_args():
     parser.add_argument('--optimizer', default="LazyGreedy", type=str, help='optimizer for detrimental instance dropping')
     
     # DPP adaptive weight parameters
+    parser.add_argument('--generate_mixed_subset', default=True, type=bool, help='whether to generate a mixed subset')
     parser.add_argument('--adaptive_dpp', default=False, type=parse_bool, const=True, nargs='?', help='Use adaptive DPP weights')
     parser.add_argument('--use_learnable_lambda', default=True, type=parse_bool, const=True, nargs='?', help='Use truly learnable lambda parameter')
     parser.add_argument('--dpp_weight', default=0.5, type=float, help='Base DPP weight when not using adaptive/learnable weighting')
@@ -127,7 +128,7 @@ def get_args():
                       help='Ratio between DPP and Submodular in remaining budget after spectral (0=all submod, 1=all DPP)')
 
     # others
-    parser.add_argument('--use_wandb', default=False, type=parse_bool, const=True, nargs='?')
+    parser.add_argument('--use_wandb', default=True, type=parse_bool, const=True, nargs='?')
 
     args = parser.parse_args()
 

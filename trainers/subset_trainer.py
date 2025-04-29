@@ -41,9 +41,19 @@ class SubsetTrainer(BaseTrainer):
 
 
     def _train_epoch(self, epoch):
-        # select a subset of the data
-        self._select_subset(epoch, len(self.train_loader) * epoch)
-        self._update_train_loader_and_weights()
+        # Only select a subset of the data if needed
+        # Check if we need to select a new subset for this epoch
+        need_to_select = True
+        if hasattr(self, '_needs_subset_refresh'):
+            # Use the flag set by the BaseTrainer
+            need_to_select = self._needs_subset_refresh
+        
+        if need_to_select:
+            self.args.logger.info(f"Epoch {epoch}: Selecting new subset")
+            self._select_subset(epoch, len(self.train_loader) * epoch)
+            self._update_train_loader_and_weights()
+        else:
+            self.args.logger.info(f"Epoch {epoch}: Reusing existing subset")
 
         self.model.train()
         self._reset_metrics()

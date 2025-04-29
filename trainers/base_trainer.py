@@ -117,7 +117,29 @@ class BaseTrainer:
         if self.args.resume_from_epoch > 0:
             self._load_checkpoint(self.args.resume_from_epoch)
 
+        # Calculate when to refresh subset for CREST training
+        # If subset_refresh_frequency is defined, use it to determine refresh epochs
+        subset_refresh_frequency = getattr(self, 'subset_refresh_frequency', 1)  # Default to 1 if not specified
+        refresh_epochs = set()
+        
+        if hasattr(self, 'subset_refresh_frequency') and self.args.warm_start_epochs >= 0:
+            # Initial epoch after warmup
+            refresh_epochs.add(self.args.warm_start_epochs)
+            
+            # Add all refresh epochs based on frequency
+            for e in range(self.args.warm_start_epochs, self.args.epochs):
+                if (e - self.args.warm_start_epochs) % subset_refresh_frequency == 0:
+                    refresh_epochs.add(e)
+                    
+            self.args.logger.info(f"Subset refresh epochs: {sorted(list(refresh_epochs))}")
+
         for epoch in range(self.args.resume_from_epoch, self.args.epochs):
+            # For CREST training: Set a flag to indicate if this epoch needs subset refresh
+            if hasattr(self, 'subset_refresh_frequency'):
+                self._needs_subset_refresh = epoch in refresh_epochs
+                if self._needs_subset_refresh:
+                    self.args.logger.info(f"Epoch {epoch}: Will refresh subset")
+                    
             self._train_epoch(epoch)
             self._val_epoch(epoch)
             self._log_epoch(epoch)
@@ -304,4 +326,4 @@ class BaseTrainer:
             "forward_time": self.batch_forward_time.avg,
             "backward_time": self.batch_backward_time.avg,
         }
-    
+
