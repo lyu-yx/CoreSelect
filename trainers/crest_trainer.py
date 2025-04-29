@@ -3,11 +3,14 @@ from utils.learnable_lambda import LearnableLambda
 from datasets.subset import get_coreset
 from .subset_trainer import *
 import time
+import torch.nn.functional as F
+from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
 
 
 class CRESTTrainer(SubsetTrainer):
     def __init__(
-        self, 
+        self,
         args: argparse.Namespace,
         model: nn.Module,
         train_dataset: IndexedDataset,
@@ -18,43 +21,67 @@ class CRESTTrainer(SubsetTrainer):
         self.train_indices = np.arange(len(self.train_dataset))
         self.steps_per_epoch = np.ceil(int(len(self.train_dataset) * self.args.train_frac) / self.args.batch_size).astype(int)
         self.reset_step = self.steps_per_epoch
-        self.random_sets = np.array([])
 
-        self.num_checking = 0
-
-        self.gradient_approx_optimizer = Adahessian(self.model.parameters())
-
-        self.loss_watch = np.ones((self.args.watch_interval, len(self.train_dataset))) * -1
-
+        # Performance metrics
         self.approx_time = AverageMeter()
-        self.compare_time = AverageMeter()
+        self.selection_time = AverageMeter()
         self.similarity_time = AverageMeter()
         
-        # Initialize learnable lambda parameter for DPP weight
-        self.use_learnable_lambda = getattr(self.args, 'use_learnable_lambda', True)
-        if self.use_learnable_lambda:
-            self.learnable_lambda = LearnableLambda(
-                num_classes=self.args.num_classes,
-                initial_value=getattr(self.args, 'dpp_weight', 0.5),
-                min_value=getattr(self.args, 'min_dpp_weight', 0.2),
-                max_value=getattr(self.args, 'max_dpp_weight', 0.8),
-                meta_lr=getattr(self.args, 'meta_lr', 0.01),
-                use_per_class=getattr(self.args, 'per_class_lambda', True),
-                device=self.args.device
-            )
-            self.args.logger.info(f"Using learnable lambda for DPP weight")
+        # Gradient approximation
+        self.gradient_approx_optimizer = Adahessian(self.model.parameters())
+        self.num_checking = 0
+
+        # For tracking already selected samples
+        self.selection_history = {}  # Maps epoch -> selected indices
+        self.selection_quality = {}  # Maps indices -> quality score
+        
+        # Configure subset selection parameters with optimized defaults
+        # Allow up to 10% of full dataset or 5000 instances, whichever is smaller
+        self.max_subset_size = min(
+            int(len(self.train_dataset) * 0.1),  # 10% of dataset
+            getattr(self.args, 'max_subset_size', 5000)  # Default max of 5000
+        )
+        
+        # Update subset less frequently for training stability and efficiency
+        self.subset_refresh_frequency = getattr(self.args, 'subset_refresh_frequency', 10)
+        
+        # Allow configuring the ratio between diversity and coverage
+        self.dpp_weight = getattr(self.args, 'dpp_weight', 0.5)
+        
+        # Ensure drop_detrimental is False by default
+        self.args.drop_detrimental = getattr(self.args, 'drop_detrimental', False)
+        
+        # Batch size for inference
+        self.inference_batch_size = getattr(self.args, 'inference_batch_size', self.args.batch_size * 2)
+        
+        # Configure parallel processing
+        self.num_workers = min(getattr(self.args, 'selection_workers', multiprocessing.cpu_count() // 2), 
+                               multiprocessing.cpu_count() - 1)
+        
+        # Mixed precision training
+        self.use_mixed_precision = getattr(self.args, 'use_mixed_precision', True)
+        if self.use_mixed_precision and torch.cuda.is_available():
+            self.scaler = torch.cuda.amp.GradScaler()
         else:
-            # Initialize adaptive DPP weights tracking (fallback to previous implementation)
-            self.adaptive_dpp_weights = {}  # Class-specific adaptive weights
-            self.base_dpp_weight = getattr(self.args, 'dpp_weight', 0.5)  # Default to 0.5 if not specified
-            self.max_dpp_weight = getattr(self.args, 'max_dpp_weight', 0.8)  # Maximum diversity weight
-            self.min_dpp_weight = getattr(self.args, 'min_dpp_weight', 0.2)  # Minimum diversity weight
-            self.dpp_schedule_factor = getattr(self.args, 'dpp_schedule_factor', 1.0)  # How quickly to ramp up diversity
-            self.gradient_alignment_threshold = getattr(self.args, 'gradient_alignment_threshold', 0.7)  # Threshold for gradient alignment
+            self.use_mixed_precision = False
+        
+        # Cache subset selection to avoid redundant computations
+        self.cached_outputs = {}  # Maps (epoch_range, index) -> output
+        self.cached_gradients = None
+        self.cached_epoch = -1
+        
+        self.args.logger.info(f"High-Performance CREST trainer initialized:")
+        self.args.logger.info(f"  - Max subset size: {self.max_subset_size} samples")
+        self.args.logger.info(f"  - Subset refresh frequency: Every {self.subset_refresh_frequency} epochs")
+        self.args.logger.info(f"  - DPP weight (diversity vs coverage): {self.dpp_weight}")
+        self.args.logger.info(f"  - Detrimental sample dropping: {self.args.drop_detrimental}")
+        self.args.logger.info(f"  - Selection workers: {self.num_workers}")
+        self.args.logger.info(f"  - Mixed precision training: {self.use_mixed_precision}")
+        self.args.logger.info(f"  - Inference batch size: {self.inference_batch_size}")
 
     def _train_epoch(self, epoch: int):
         """
-        Train the model for one epoch
+        Train the model for one epoch with optimized subset selection
         :param epoch: current epoch
         """
         self.model.train()
@@ -63,895 +90,403 @@ class CRESTTrainer(SubsetTrainer):
         lr = self.lr_scheduler.get_last_lr()[0]
         self.args.logger.info(f"Epoch {epoch} LR {lr:.6f}")
 
-        for training_step in range(self.steps_per_epoch * epoch, self.steps_per_epoch * (epoch + 1)):
+        # Only select subset at initial epoch or at fixed refresh intervals
+        need_new_subset = (epoch == self.args.warm_start_epochs) or \
+                          (epoch >= self.args.warm_start_epochs and 
+                           (epoch - self.args.warm_start_epochs) % self.subset_refresh_frequency == 0)
+        if need_new_subset or not hasattr(self, 'current_subset'):
+            # Only select a new subset every refresh interval
+            self._select_subset(epoch)
+            self.current_subset = self.subset.copy()
+            self.current_weights = self.subset_weights.copy()
+        else:
+            # Always reuse the cached subset and weights
+            self.subset = self.current_subset.copy()
+            self.subset_weights = self.current_weights.copy()
+        self._update_train_loader_and_weights()
 
-            # if (training_step > self.reset_step) and ((training_step - self.reset_step) % self.args.check_interval == 0):
-            #     self._check_approx_error(epoch, training_step)
-
-            # if epoch >= self.args.drop_after and (epoch % self.args.drop_interval == 0) and training_step == self.steps_per_epoch * epoch: # drop detrimental data at the begining of target epoch
-            #     subset = self._select_subset_drop_detrimental(epoch, training_step)
-            #     keep = np.where(self.times_selected[subset] == epoch)[0]
-            #     subset = subset[keep]
-            #     self._update_train_loader_and_weights()
-
-            if training_step % self.steps_per_epoch == 0 and training_step >= self.steps_per_epoch:
-                self._select_subset_drop_detrimental(epoch, training_step)
-                self._update_train_loader_and_weights()
-                self.train_iter = iter(self.train_loader)
-                self._get_quadratic_approximation(epoch, training_step)
-                
-            elif training_step == 0:
-                self.train_iter = iter(self.train_loader)
-
-            data_start = time.time()
-            try:
-                batch = next(self.train_iter)
-            except StopIteration:
-                if self.args.cache_dataset and self.args.clean_cache_iteration:
-                    self.train_dataset.clean()
-                    self._update_train_loader_and_weights()
-                self.train_iter = iter(self.train_loader)
-                batch = next(self.train_iter)
-
-            data, target, data_idx = batch
-            data, target = data.to(self.args.device), target.to(self.args.device)
+        # Training loop
+        num_batches = len(self.train_loader)
+        if num_batches == 0:
+            self.args.logger.warning(f"Epoch {epoch}: Train loader is empty. Skipping epoch.")
+            return
+            
+        self.args.logger.info(f"Epoch {epoch}: Training with {len(self.train_loader.dataset)} samples across {num_batches} batches")
+        
+        # Standard training loop with optimizations
+        data_start = time.time()
+        for batch_idx, (data, target, data_idx) in enumerate(self.train_loader):
+            # Load data to device
             data_time = time.time() - data_start
             self.batch_data_time.update(data_time)
-
+            
+            # Forward and backward pass with potential mixed precision
             loss, train_acc = self._forward_and_backward(data, target, data_idx)
-
-            data_start = time.time()
-
+            
+            # Log progress periodically
+            if (batch_idx + 1) % self.args.log_interval == 0 or batch_idx == num_batches - 1:
+                self.args.logger.info(
+                    f"Epoch {epoch} Batch [{batch_idx+1}/{num_batches}] "
+                    f"Loss {self.train_loss.avg:.4f} Acc {self.train_acc.avg:.4f} "
+                    f"DataTime {self.batch_data_time.avg:.3f} "
+                    f"FwdTime {self.batch_forward_time.avg:.3f} "
+                    f"BwdTime {self.batch_backward_time.avg:.3f}"
+                )
+            
+            # Log to wandb
             if self.args.use_wandb:
                 wandb.log({
                     "epoch": epoch,
-                    "training_step": training_step,
-                    "train_loss": loss.item(),
-                    "train_acc": train_acc})
-
-
-    def _forward_and_backward(self, data, target, data_idx):
-        self.optimizer.zero_grad()
-
-        # train model with the current batch and record forward and backward time
-        forward_start = time.time()
-        output = self.model(data)
-        forward_time = time.time() - forward_start
-        self.batch_forward_time.update(forward_time)
-
-        loss = self.train_criterion(output, target)
-        loss = (loss * self.train_weights[data_idx]).mean()
-
-        lr = self.lr_scheduler.get_last_lr()[0]
-        if lr > 0:
-            # compute the parameter change delta
-            self.model.zero_grad()
-            # approximate with hessian diagonal
-            loss.backward(create_graph=True)
-            gf_current, _, _ = self.gradient_approx_optimizer.step(momentum=False)                   
-            self.delta -= lr * gf_current
-
-        backward_start = time.time()
-        loss.backward()
-        self.optimizer.step()
-        backward_time = time.time() - backward_start
-        self.batch_backward_time.update(backward_time)
-
-        # update training loss and accuracy
-        train_acc = (output.argmax(dim=1) == target).float().mean().item()
-        self.train_loss.update(loss.item(), data.size(0))
-        self.train_acc.update(train_acc, data.size(0))
-
-        return loss, train_acc
-
-
-    def _get_quadratic_approximation(self, epoch: int, training_step: int):
-        """
-        Compute the quadratic approximation of the loss function
-        :param epoch: current epoch
-        :param training_step: current training step
-        """
-
-        if self.args.approx_with_coreset:
-            # Update the second-order approximation with the coreset
-            approx_loader = DataLoader(
-                Subset(self.train_dataset, indices=self.subset),
-                batch_size=self.args.batch_size,
-                shuffle=True,
-                num_workers=self.args.num_workers,
-                pin_memory=True,
-                sampler=None,
-            )
-        else:
-            # Update the second-order approximation with random subsets
-            approx_loader = DataLoader(
-                Subset(self.train_dataset, indices=self.random_sets),
-                batch_size=self.args.batch_size,
-                shuffle=True,
-                num_workers=self.args.num_workers,
-                pin_memory=True,
-                sampler=None,
-            )
-
-        approx_start = time.time()
-        curvature_norm = AverageMeter()
-        self.start_loss = AverageMeter()
-        for approx_batch, (input, target, idx) in enumerate(approx_loader):
-            target = target.cuda()
-            input_var = input.cuda()
-            target_var = target
-
-            # compute output
-            output = self.model(input_var)
+                    "batch": batch_idx,
+                    "train_loss_batch": loss.item(),
+                    "train_acc_batch": train_acc,
+                    "lr": lr
+                })
                 
-            if self.args.approx_with_coreset:
-                loss = self.train_criterion(output, target_var)
-                batch_weight = self.train_weights[idx.long()]
-                loss = (loss * batch_weight).mean()
-            else:
-                loss = self.val_criterion(output, target_var)
-            self.model.zero_grad()
-
-            # approximate with hessian diagonal
-            loss.backward(create_graph=True)
-            gf_tmp, ggf_tmp, ggf_tmp_moment = self.gradient_approx_optimizer.step(momentum=True)
-
-            if approx_batch == 0:
-                self.gf = gf_tmp * len(idx)
-                self.ggf = ggf_tmp * len(idx)
-                self.ggf_moment = ggf_tmp_moment * len(idx)
-            else:
-                self.gf += gf_tmp * len(idx)
-                self.ggf += ggf_tmp * len(idx)
-                self.ggf_moment += ggf_tmp_moment * len(idx)
-
-            curvature_norm.update(ggf_tmp_moment.norm())
-            self.start_loss.update(loss.item(), input.size(0))
-
-        approx_time = time.time() - approx_start
-        self.approx_time.update(approx_time)
-
-        self.gf /= len(approx_loader.dataset)
-        self.ggf /= len(approx_loader.dataset)
-        self.ggf_moment /= len(approx_loader.dataset)
-        self.delta = 0
-
-        gff_norm = curvature_norm.avg
-        self.start_loss = self.start_loss.avg
-        if self.args.approx_moment:
-            self.ggf = self.ggf_moment
-
-        if training_step == self.steps_per_epoch:
-            self.init_curvature_norm = gff_norm 
+            # Start timing next data loading
+            data_start = time.time()
+    
+    def _get_train_output_efficient(self, indices=None):
+        """
+        Efficiently compute model outputs for given indices with batching and parallel processing
+        
+        :param indices: Indices to compute outputs for (if None, compute for all data)
+        """
+        self.model.eval()
+        
+        # Determine which indices to process
+        if indices is None:
+            indices_to_process = self.train_indices
         else:
-            self.args.check_interval = int(torch.ceil(self.init_curvature_norm / gff_norm * self.args.interval_mul))
-            self.args.num_minibatch_coreset = min(self.args.check_interval * self.args.batch_num_mul, self.steps_per_epoch)
-        self.args.logger.info(f"Checking interval {self.args.check_interval}. Number of minibatch coresets {self.args.num_minibatch_coreset}")
-        if self.args.use_wandb:
-            wandb.log({
-                'epoch': epoch,
-                'training_step': training_step,
-                'ggf_norm': gff_norm,
-                'check_interval': self.args.check_interval,
-                'num_minibatch_coreset': self.args.num_minibatch_coreset})
-
-    def _check_approx_error(self, epoch:int, training_step: int) -> torch.Tensor:
-        """
-        Check the approximation error of the current batch
-        :param epoch: current epoch
-        :param training_step: current training step
-        """
-        self.num_checking += 1
-        start_compare = time.time()
-        self._get_train_output()
-        true_loss = self.val_criterion(
-            torch.from_numpy(self.train_output[self.random_sets]), 
-            torch.from_numpy(self.train_target[self.random_sets])
-            )
-        
-        delta_norm = torch.norm(self.delta)
-
-        approx_loss = torch.matmul(self.delta, self.gf) + self.start_loss
-        approx_loss += 1 / 2 * torch.matmul(self.delta * self.ggf, self.delta)
-
-        loss_diff = abs(true_loss - approx_loss.item())
-        thresh = self.args.check_thresh_factor * true_loss
-
-        log_str = f"Iter {training_step} loss difference {loss_diff:.3f} threshold {thresh:.3f} True loss {true_loss:.3f} Approx loss {approx_loss.item():.3f} Delta norm {delta_norm:.3f}"
+            indices_to_process = indices
             
-        if loss_diff > thresh:
-            self.reset_step = training_step
-            log_str += f" is larger than threshold {thresh:.3f}. "
-        self.args.logger.info(log_str)
-
-        compare_time = time.time() - start_compare
-        self.compare_time.update(compare_time)
-
-        if self.args.use_wandb:
-            wandb.log({
-                'epoch': epoch,
-                'training_step': training_step,
-                'loss_diff': loss_diff, 
-                'loss_thresh': thresh,
-                'delta_norm': delta_norm,
-                'num_checking': self.num_checking})
-            
-    def _drop_learned_data(self, epoch: int, training_step: int, indices: np.ndarray):
-        """
-        Drop the learned data points
-        :param epoch: current epoch
-        :param training_step: current training step
-        :param indices: indices of the data points that have valid predictions
-        """
+        # Create dataset and dataloader for efficient processing
+        eval_dataset = Subset(self.train_dataset, indices_to_process)
+        eval_loader = DataLoader(
+            eval_dataset,
+            batch_size=self.inference_batch_size,  # Larger batch size for inference
+            shuffle=False,
+            num_workers=min(self.args.num_workers * 2, 16),  # More workers for inference
+            pin_memory=True
+        )
         
-        self.loss_watch[epoch % self.args.watch_interval, indices] = self.train_criterion(
-            torch.from_numpy(self.train_output[indices]), torch.from_numpy(self.train_target[indices]).long()).numpy()
-                        
-        if ((epoch+1) % self.args.drop_interval == 0):
-            # 1. identifies data points that have large loss values or Untracked instance.
-            # 2. selects a subset of the data points above selected set.
-            order_ = np.where(np.sum(self.loss_watch>self.args.drop_thresh, axis=0)>0)[0]
-            unselected = np.where(np.sum(self.loss_watch>=0, axis=0)==0)[0]
-            order_ = np.concatenate([order_, unselected])
-
-            order = []
-            per_class_size = int(np.ceil(self.args.random_subset_size * self.args.train_size / self.args.num_classes))
-            for c in np.unique(self.train_target):
-                class_indices_new = np.intersect1d(np.where(self.train_target == c)[0], order_)
-                if len(class_indices_new) > per_class_size:
-                    order.append(class_indices_new)
+        # Initialize arrays if they don't exist
+        if not hasattr(self, 'train_output') or self.train_output.shape[0] != len(self.train_dataset):
+            self.train_output = np.zeros((len(self.train_dataset), self.args.num_classes))
+            self.train_softmax = np.zeros((len(self.train_dataset), self.args.num_classes))
+        
+        # Process batches in parallel if possible
+        with torch.no_grad():
+            for data, _, data_idx in eval_loader:
+                data = data.to(self.args.device, non_blocking=True)
+                
+                # Use mixed precision for faster inference
+                if self.use_mixed_precision:
+                    with torch.cuda.amp.autocast():
+                        output = self.model(data)
                 else:
-                    class_indices = np.intersect1d(np.where(self.train_target == c)[0], self.train_indices)
-                    order.append(class_indices)
-            order = np.concatenate(order)
-            
-            if len(order) > self.args.min_train_size:
-                self.train_indices = order
-
-            if self.args.use_wandb:
-                wandb.log({
-                    'epoch': epoch,
-                    'forgettable_train': len(self.train_indices)})
+                    output = self.model(data)
                 
-
-
-    def _drop_detrimental_data(self, epoch: int, training_step: int, indices: np.ndarray, preds):
-        """
-        Drop the detrimental data points using EPIC-style filtering.
+                # Compute softmax efficiently on GPU before transferring to CPU
+                softmax_output = F.softmax(output, dim=1)
+                
+                # Update arrays
+                self.train_output[data_idx] = output.cpu().numpy()
+                self.train_softmax[data_idx] = softmax_output.cpu().numpy()
         
-        :param epoch: current epoch
-        :param training_step: current training step
-        :param indices: indices of the data points that have valid predictions
-        :param preds: predictions corresponding to those indices
-        :return: updated indices after dropping detrimental data.
-        """
-        if len(indices) == 0 or epoch < self.args.drop_after:
-            return indices
-            
-        # Only drop on specific epochs based on frequency setting
-        if not ((epoch % self.args.drop_interval == 0) and epoch >= self.args.drop_after):
-            return indices
-            
-        # Initialize times_selected if not already present
-        if not hasattr(self, 'times_selected'):
-            self.times_selected = torch.zeros(len(self.train_dataset))
-            
-        # Update selection counts for current indices
-        self.times_selected[indices] += 1
-            
-        N = len(indices)
-        # Ensure we don't try to sample more than available
-        class_counts = np.bincount(self.train_target[indices])
-        min_class_count = np.min(class_counts[class_counts > 0])
-        B = min(self.args.detrimental_cluster_num, N)
+        self.model.train()
         
-        self.args.logger.info(f'Identifying small clusters at epoch {epoch}...')
+    def _select_coreset(self, pool_indices, epoch: int):
+        """
+        Helper method to select a coreset within a single selection step.
+        This method is optimized to run only when needed.
+        """
+        self.args.logger.info(f"Starting coreset selection for pool of {len(pool_indices)} samples")
+        
+        # Determine target subset size
+        target_subset_size = int(len(self.train_dataset) * self.args.train_frac)
+        target_subset_size = min(target_subset_size, self.max_subset_size)
+        
+        # Get predictions and targets for candidate pool
+        preds = self.train_softmax[pool_indices]
+        targets = self.train_target[pool_indices]
+        
+        # Calculate gradient features for selection
+        one_hot_labels = np.zeros((len(targets), self.args.num_classes))
+        one_hot_labels[np.arange(len(targets)), targets] = 1
+        gradients = preds - one_hot_labels  # Gradient of cross-entropy w.r.t logits
+        
+        # Perform selection using mixed method
+        selection_method = getattr(self.args, 'selection_method', 'mixed')
+        
+        # Use internal selection implementation to prevent multiple calls to subset_generator
+        # This addresses the issue of multiple selection logs in the output
+        if len(pool_indices) > 10000 and selection_method == "mixed":
+            subset_indices, weights = self._fast_mixed_selection(
+                gradients, targets, preds, target_subset_size
+            )
+        else:
+            # Use internal selection method directly without going through the SubsetGenerator
+            # to avoid unnecessary logging
+            subset_indices, weights = self._internal_mixed_selection(
+                gradients, 
+                targets, 
+                preds, 
+                target_subset_size
+            )
+        
+        # Map local indices back to global
+        global_indices = pool_indices[subset_indices]
+        return global_indices, weights
+        
+    def _internal_mixed_selection(self, features, labels, softmax_preds, subset_size):
+        """
+        Internal mixed selection implementation to avoid multiple calls to subset_generator
+        This ensures we don't log the selection process multiple times
+        """
+        # Process by class for better efficiency
+        classes = np.unique(labels)
+        class_counts = [np.sum(labels == c) for c in classes]
+        class_fractions = np.array(class_counts) / len(labels)
+        
+        # Calculate target size per class
+        targets_per_class = np.int32(np.ceil(class_fractions * subset_size))
+        
+        # Ensure we don't select more than subset_size
+        while np.sum(targets_per_class) > subset_size:
+            idx_to_reduce = np.argmax(targets_per_class)
+            targets_per_class[idx_to_reduce] -= 1
+        
+        # Selection per class (no logging)
+        all_indices = []
+        all_weights = []
+        
+        for c_idx, cls in enumerate(classes):
+            target_size = targets_per_class[c_idx]
+            if target_size <= 0:
+                continue
+                
+            class_mask = (labels == cls)
+            class_indices = np.where(class_mask)[0]
+            if len(class_indices) == 0:
+                continue
+                
+            # Extract class features and normalize
+            class_features = features[class_indices]
+            norms = np.linalg.norm(class_features, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            normalized_features = class_features / norms
+            
+            # Compute similarity matrix
+            similarity_matrix = np.dot(normalized_features, normalized_features.T)
+            
+            # Greedy selection
+            selected = []
+            remaining = list(range(len(class_indices)))
+            
+            # Select first element based on representation
+            if remaining:
+                row_sums = np.sum(similarity_matrix, axis=1)
+                best_idx = np.argmax(row_sums)
+                selected.append(best_idx)
+                remaining.remove(best_idx)
+            
+            # Select remaining elements
+            for _ in range(min(target_size - 1, len(class_indices) - 1)):
+                if not remaining:
+                    break
+                    
+                best_idx = -1
+                best_gain = -float('inf')
+                
+                batch_size = min(1000, len(remaining))
+                for i in range(0, len(remaining), batch_size):
+                    batch = remaining[i:min(i + batch_size, len(remaining))]
+                    
+                    # Compute coverage and diversity scores
+                    coverage_sims = similarity_matrix[batch, :]
+                    coverage_scores = np.sum(coverage_sims, axis=1)
+                    
+                    if selected:
+                        diversity_penalty = np.max(similarity_matrix[batch, :][:, selected], axis=1)
+                    else:
+                        diversity_penalty = np.zeros(len(batch))
+                    
+                    # Combined score with weighted diversity
+                    combined_scores = (1.0 - self.dpp_weight) * coverage_scores - self.dpp_weight * diversity_penalty
+                    
+                    # Find best element
+                    batch_best_idx = np.argmax(combined_scores)
+                    batch_best_gain = combined_scores[batch_best_idx]
+                    
+                    if batch_best_gain > best_gain:
+                        best_gain = batch_best_gain
+                        best_idx = batch[batch_best_idx]
+                
+                if best_idx != -1:
+                    selected.append(best_idx)
+                    remaining.remove(best_idx)
+            
+            # Calculate weights and map indices
+            if selected:
+                row_sums = np.sum(similarity_matrix[selected, :], axis=1)
+                class_weights = row_sums / np.sum(row_sums)
+                
+                # Convert to global indices
+                global_indices = [class_indices[idx] for idx in selected]
+                
+                all_indices.extend(global_indices)
+                all_weights.extend(class_weights)
+        
+        # Convert to numpy arrays
+        indices = np.array(all_indices, dtype=np.int32)
+        weights = np.array(all_weights, dtype=np.float32)
+        
+        # Normalize weights
+        if len(weights) > 0:
+            weights = weights / np.sum(weights)
+            
+        return indices, weights
+
+    def _select_subset_impl(self, epoch: int):
+        """
+        Select a high-quality subset of training data, optimized for efficiency
+        
+        :param epoch: Current epoch
+        """
+        selection_start = time.time()
+        self.args.logger.info(f"Epoch {epoch}: Starting optimized subset selection")
+        
+        # Determine target subset size
+        target_subset_size = int(len(self.train_dataset) * self.args.train_frac)
+        target_subset_size = min(target_subset_size, self.max_subset_size)
+        
+        # Use cached outputs if available from recent epochs to save computation
+        use_cached = (epoch - self.cached_epoch <= 2) and hasattr(self, 'cached_pool_indices')
+        
+        if not use_cached:
+            # For large datasets, use sampling to speed up computation
+            if len(self.train_dataset) > 50000:
+                # Sample size proportional to dataset size but capped
+                sample_size = min(50000, len(self.train_dataset) // 2)
+                sample_indices = self._select_stratified_random(self.train_indices, sample_size)
+                self._get_train_output_efficient(indices=sample_indices)
+                pool_indices = sample_indices
+            else:
+                # For smaller datasets, compute on the entire dataset
+                self._get_train_output_efficient()
+                pool_indices = self.train_indices
+                
+            # Cache the results
+            self.cached_pool_indices = pool_indices
+            self.cached_epoch = epoch
+        else:
+            # Use cached data
+            self.args.logger.info(f"Using cached model outputs from epoch {self.cached_epoch}")
+            pool_indices = self.cached_pool_indices
         
         try:
-            # Step 1: Get coreset with clustering information
-            subset, subset_weights, ordering_time, similarity_time, cluster = get_coreset(
-                preds,
-                self.train_target[indices],
-                N,
-                B,
-                self.args.num_classes,
-                equal_num=True,
-                optimizer=self.args.optimizer,
-            )
+            # Use optimized selection
+            self.subset, self.subset_weights = self._select_coreset(pool_indices, epoch)
             
-            # Map the selected subset back to global indices 
-            subset = indices[subset]
-            
-            # Create a cluster mapping for the full dataset
-            cluster_map = -np.ones(len(self.train_target), dtype=int)
-            cluster_map[indices] = cluster
-            
-            # Calculate cluster sizes and identify small clusters
-            cluster_sizes = {}
-            for c in range(np.max(cluster) + 1):
-                cluster_sizes[c] = np.sum(cluster == c)
-                
-            # Get threshold based on percentile of cluster sizes
-            cluster_size_values = np.array(list(cluster_sizes.values()))
-            threshold = np.percentile(cluster_size_values, self.args.cluster_thresh)
-            
-            # Identify the small clusters to be dropped
-            small_clusters = [c for c, size in cluster_sizes.items() if size <= threshold]
-            
-            self.args.logger.info(f"Found {len(small_clusters)} small clusters out of {np.max(cluster) + 1} total clusters")
-            self.args.logger.info(f"Cluster size threshold: {threshold}")
-            
-            # Keep only points that are NOT in small clusters
-            keep_mask = ~np.isin(cluster, small_clusters)
-            keep_indices = indices[keep_mask]
-            
-            # EPIC specific: Keep only instances that match the epoch count
-            # This prevents selecting the same instance multiple times
-            if hasattr(self, 'times_selected'):
-                # Follow EPIC's approach: keep = np.where(times_selected[subset] == epoch)[0]
-                match_epoch = np.where(self.times_selected[keep_indices].cpu().numpy() == epoch)[0]
-                keep_indices = keep_indices[match_epoch]
-            
-            # Safety check: ensure we're not dropping too many points
-            if len(keep_indices) < self.args.min_batch_size:
-                self.args.logger.warning(
-                    f"Too few samples after detrimental drop: {len(keep_indices)}. "
-                    f"Using original indices instead."
-                )
-                keep_indices = indices
-                
         except Exception as e:
-            self.args.logger.warning(f"Error in coreset selection: {e}. Using original indices.")
-            keep_indices = indices
+            self.args.logger.error(f"Error during subset selection: {e}")
+            self.args.logger.warning("Falling back to random subset selection")
+            
+            # Fallback to simple random selection
+            self.subset = np.random.choice(
+                self.train_indices, 
+                size=min(target_subset_size, len(self.train_indices)),
+                replace=False
+            )
+            self.subset_weights = np.ones(len(self.subset)) / len(self.subset)
         
-        drop_percentage = 100 * (1 - len(keep_indices) / len(indices))
+        # Store selection history
+        self.selection_history[epoch] = self.subset.copy()
+        
+        # Calculate quality metrics for future reference (using vectorized operations)
+        if len(self.subset) > 0:
+            # Use model predictions to estimate sample quality
+            subset_preds = self.train_softmax[self.subset]
+            subset_targets = self.train_target[self.subset]
+            
+            # Calculate per-sample loss (vectorized)
+            sample_losses = -np.log(np.maximum(
+                subset_preds[np.arange(len(subset_targets)), subset_targets], 
+                1e-8
+            ))
+            
+            # Update quality metrics (vectorized)
+            quality_scores = 1.0 / (1.0 + sample_losses)
+            
+            # Update quality dictionary in one operation
+            self.selection_quality.update(dict(zip(self.subset, quality_scores)))
+        
+        # Log selection stats
+        total_selection_time = time.time() - selection_start
         self.args.logger.info(
-            f"Epoch {epoch}: Kept {len(keep_indices)}/{len(indices)} points after detrimental filtering "
-            f"({drop_percentage:.2f}% dropped)"
+            f"Epoch {epoch}: Selected {len(self.subset)} samples ({len(self.subset)/len(self.train_dataset)*100:.1f}% of dataset). "
+            f"Total selection time: {total_selection_time:.2f}s"
         )
         
-        # Log detailed metrics
         if self.args.use_wandb:
-            metrics = {
+            wandb.log({
                 'epoch': epoch,
-                'training_step': training_step,
-                'detrimental_drop_count': len(keep_indices),
-                'detrimental_drop_percentage': drop_percentage,
-                'cluster_count': np.max(cluster) + 1 if 'cluster' in locals() else 0,
-                'small_cluster_count': len(small_clusters) if 'small_clusters' in locals() else 0,
-                'cluster_threshold': threshold if 'threshold' in locals() else 0
-            }
-            wandb.log(metrics)
-        
-        return keep_indices
-
-    def _select_random_set(self) -> np.ndarray:
-        indices = []
-        for c in np.unique(self.train_target):
-            class_indices = np.intersect1d(np.where(self.train_target == c)[0], self.train_indices)
-            indices_per_class = np.random.choice(class_indices, size=int(np.ceil(self.args.random_subset_size * self.args.train_size / self.args.num_classes)), replace=False)
-            indices.append(indices_per_class)
-        indices = np.concatenate(indices)
-        return indices
-
-    def _select_subset(self, epoch: int, training_step: int):
-        """
-        Select a subset of the data - ensure this uses the proper gradient flow for 
-        aligning with the theoretical framework of:
-        F(S) = f(S) + λD(S)
-        where f(S) is the coverage function and D(S) is the diversity function.
-        """
-        super()._select_subset(epoch, training_step)
-        
-        # get random subsets
-        self.random_sets = []
-        self.subset = []
-        self.subset_weights = []
-        
-        for _ in range(self.args.num_minibatch_coreset):
-            # get a random subset of the data
-            random_subset = self._select_random_set()
-            self.random_sets.append(random_subset)
+                'total_selection_time': total_selection_time,
+                'final_subset_size': len(self.subset),
+                'dpp_weight': self.dpp_weight,
+                'subset_fraction': len(self.subset)/len(self.train_dataset)
+            })
             
-        self.train_val_loader = DataLoader(
-            Subset(self.train_dataset, indices=np.concatenate(self.random_sets)),
-            batch_size=self.args.batch_size,
-            shuffle=True,
-            num_workers=self.args.num_workers,
-            pin_memory=True,
-        )
-        
-        self._get_train_output()
-        
-        # drop the learned data points
-        if self.args.drop_learned:
-            self._drop_learned_data(epoch, training_step, np.concatenate(self.random_sets))
-            
-        for random_set in self.random_sets:
-            preds = self.train_softmax[random_set]
-            print(f"Epoch [{epoch}] [Greedy], pred size: {np.shape(preds)}")
-            
-            if np.shape(preds)[-1] == self.args.num_classes:
-                # This is the gradient of cross-entropy loss w.r.t. logits: ∇L(x,θ) = softmax(logits) - one_hot
-                # This aligns with the theory where we use gradients to measure sample importance
-                preds -= np.eye(self.args.num_classes)[self.train_target[random_set]]
-                
-                # The subset selection objective implicitly optimizes for:
-                # f(S) = coverage of gradient space (via facility location)
-                subset, weight, _, similarity_time = self.subset_generator.generate_subset(
-                    preds=preds,  # These are the gradients
-                    epoch=epoch,
-                    B=self.args.batch_size,
-                    idx=random_set,
-                    targets=self.train_target,
-                    use_submodlib=(self.args.smtk==0),
-                )
-                self.similarity_time.update(similarity_time)
-                self.subset.append(subset)
-                self.subset_weights.append(weight)
-                
-        self.subset = np.concatenate(self.subset)
-        self.subset_weights = np.concatenate(self.subset_weights)
-        self.random_sets = np.concatenate(self.random_sets)
-
-    def _select_subset_drop_detrimental(self, epoch: int, training_step: int):
+    # Override the parent class method to prevent call from SubsetTrainer
+    def _select_subset(self, epoch: int, training_step: int = None):
         """
-        Select a subset of the data, dropping both learned and detrimental data points.
-        Incorporates DPP-based joint objective for better diversity and coverage.
-        
-        Key theoretical components:
-        1. Gradient-based filtering to remove detrimental points
-        2. Joint objective F(S) = f(S) + λD(S) for final selection
+        Overridden from the parent class to ensure our implementation is used
+        and to prevent multiple subset selections
         """
-
-        # ----------------------------
-        # 1. Reset and select random subsets
-        # ----------------------------
-        # Clear previous random sets to prevent growth over time
-        self.random_sets = np.array([], dtype=int)
-        self.subset = []
-        self.subset_weights = []
+        # Only select subset at initial epoch or at fixed refresh intervals
+        need_new_subset = (epoch == self.args.warm_start_epochs) or \
+                          (epoch >= self.args.warm_start_epochs and 
+                          (epoch - self.args.warm_start_epochs) % self.subset_refresh_frequency == 0)
         
-        # Track selection for metrics 
-        if not hasattr(self, 'num_selection'):
-            self.num_selection = 0
+        # Skip selection if not needed
+        if not need_new_subset:
+            self.args.logger.info(f"Epoch {epoch}: Skipping subset selection (not needed)")
+            return
+            
+        # Configure the subset generator to be aware of the refresh frequency
+        if hasattr(self.subset_generator, 'set_refresh_frequency'):
+            self.subset_generator.set_refresh_frequency(self.subset_refresh_frequency)
+            self.subset_generator.set_epoch(epoch)
+            
+        # Force a refresh since we know we need one
+        if hasattr(self.subset_generator, 'force_selection_refresh'):
+            self.subset_generator.force_selection_refresh()
+            
+        # Increment selection counter (for compatibility with parent class)
         self.num_selection += 1
         
-        # Log selection event to wandb 
         if self.args.use_wandb:
             wandb.log({"epoch": epoch, "training_step": training_step, "num_selection": self.num_selection})
             
-        # Handle dataset caching if needed 
+        # Handle dataset caching (from parent class)
         if self.args.cache_dataset:
             self.train_dataset.clean()
             self.train_dataset.cache()
             
-        # Generate stratified random subsets
-        random_sets_list = []  # Temporary list to store the random sets
-        for _ in range(self.args.num_minibatch_coreset):
-            # Select a random subset of global indices.
-            random_subset = self._select_random_set()
-            random_sets_list.append(random_subset)
-            
-        # Store the original combined random sets for processing
-        combined_random_sets = np.concatenate(random_sets_list) if random_sets_list else np.array([], dtype=int)
+        # Use our optimized subset selection
+        selection_start = time.time()
+        self._select_subset_impl(epoch)
+        selection_time = time.time() - selection_start
         
-        # ----------------------------
-        # 2. Drop learned data points globally
-        # ----------------------------
-        if self.args.drop_learned and len(combined_random_sets) > 0:
-            # This updates self.train_indices based on loss values.
-            time_start = time.time()
-            self._drop_learned_data(epoch, training_step, combined_random_sets)
-            time_end = time.time()
-            self.args.logger.info(f"Dropping learned data: {time_end - time_start:.2f} seconds")
-            
-        # Filter each random set so they contain only indices in self.train_indices.
-        filtered_random_sets = [np.intersect1d(rs, self.train_indices) for rs in random_sets_list]
+        self.args.logger.info(f"Epoch {epoch}: Complete subset selection took {selection_time:.2f} seconds")
         
-        # Update the DataLoader based on the filtered indices.
-        flat_filtered_random_sets = np.concatenate([rs for rs in filtered_random_sets if len(rs) > 0]) if filtered_random_sets else np.array([], dtype=int)
-        if len(flat_filtered_random_sets) > 0:
-            self.train_val_loader = DataLoader(
-                Subset(self.train_dataset, indices=flat_filtered_random_sets),
-                batch_size=self.args.batch_size,
-                shuffle=True,
-                num_workers=self.args.num_workers,
-                pin_memory=True,
-            )
-
-            time_start = time.time()
-            # Only compute outputs for the filtered random sets, not the entire dataset
-            self._get_train_output(indices=flat_filtered_random_sets)
-            time_end = time.time()
-            self.args.logger.info(f"_get_train_output: {time_end - time_start:.2f} seconds")
-        else:
-            self.args.logger.warning("No samples remaining after filtering random sets with train_indices")
-        
-        # ----------------------------
-        # 3. Process each random subset individually
-        # ----------------------------
-        updated_random_sets = []
-        processed_subsets = []
-        processed_weights = []
-        
-        for i, orig_random_set in enumerate(filtered_random_sets):
-            # Make a local copy so that we do not affect the global random sets.
-            local_set = orig_random_set.copy() if orig_random_set is not None else np.array([], dtype=int)
-            
-            # Skip processing if local_set is empty
-            if len(local_set) == 0:
-                self.args.logger.warning(f"Empty local set #{i} - skipping.")
-                continue
-                
-            # Get predictions for the local set.
-            preds = self.train_softmax[local_set]
-            print(f"Epoch [{epoch}] [Greedy], initial pred shape: {np.shape(preds)}")
-            
-            # ----------------------------
-            # 4. Drop detrimental points from each local set
-            # ----------------------------
-            if self.args.drop_detrimental:
-                original_size = len(local_set)
-                
-                # This is where we identify and remove points that hurt training
-                filtered_local_set = self._drop_detrimental_data(epoch, training_step, local_set, preds)
-                
-                # Safety check - if we dropped all points, revert to original set
-                if len(filtered_local_set) == 0:
-                    self.args.logger.warning(
-                        f"All points were dropped as detrimental in set #{i}. Using original set."
-                    )
-                    filtered_local_set = orig_random_set.copy()
-                
-                # Update local set with the filtered version
-                local_set = filtered_local_set
-                
-                # Recompute predictions using the updated local_set.
-                preds = self.train_softmax[local_set]
-                print(f"Epoch [{epoch}] [Greedy], after detrimental drop: {len(local_set)}/{original_size} points remain")
-            
-            # Skip subset generation if local_set is empty
-            if len(local_set) == 0:
-                self.args.logger.warning(f"Empty filtered local set #{i} after detrimental dropping - skipping.")
-                continue
-
-            # ----------------------------
-            # 5. Calculate gradient features for submodular selection
-            # ----------------------------
-            # Calculate gradient approximation for the joint objective
-            if np.shape(preds)[-1] == self.args.num_classes:
-                one_hot_labels = np.eye(self.args.num_classes)[self.train_target[local_set]]
-                
-                # Compute gradients as in CREST: g = softmax(logits) - one_hot(true_labels)
-                if one_hot_labels.shape == preds.shape:
-                    # This calculates the gradient of the cross-entropy loss with respect to the logits
-                    gradients = preds - one_hot_labels
-                else:
-                    self.args.logger.error(
-                        f"Shape mismatch: preds {preds.shape} vs one_hot {one_hot_labels.shape}. "
-                        f"Skipping gradient calculation."
-                    )
-                    gradients = preds  # Fall back to using softmax outputs if shape mismatch
-            
-                # ----------------------------
-                # 6. Apply the joint objective F(S) = f(S) + λD(S) or the spectral-influence alternative
-                # ----------------------------
-                if hasattr(self.subset_generator, 'generate_mixed_subset'):
-                    # Cache label and softmax data to avoid repeated access
-                    local_labels = self.train_target[local_set]
-                    local_softmax = self.train_softmax[local_set]
-                    
-                    # Features should be the computed gradients for theoretical alignment
-                    # Note: We reuse the gradients already computed above rather than recalculating
-                    features = gradients
-                    
-                    # Determine which selection method to use
-                    selection_method = getattr(self.args, 'selection_method', 'mixed')
-                    
-                    # For spectral method, use the command-line parameters
-                    if selection_method == 'spectral':
-                        self.args.logger.info(f"Using spectral influence selection method")
-                        
-                        # Call the spectral influence selection method
-                        subset_indices, weights = self.subset_generator.generate_spectral_influence_subset(
-                            features=features,
-                            labels=local_labels,
-                            softmax_preds=local_softmax,
-                            subset_size=min(self.args.batch_size, len(local_set)),
-                            n_clusters_factor=getattr(self.args, 'n_clusters_factor', 0.1),
-                            influence_type=getattr(self.args, 'influence_type', 'gradient_norm'),
-                            balance_clusters=getattr(self.args, 'balance_clusters', True),
-                            affinity_metric=getattr(self.args, 'affinity_metric', 'rbf'),
-                            true_gradients=features  # Use the gradients we already computed
-                        )
-                        
-                        # Log details about the selection
-                        if self.args.use_wandb:
-                            wandb.log({
-                                'epoch': epoch,
-                                'training_step': training_step,
-                                'spectral_selection_used': True,
-                                'influence_type': getattr(self.args, 'influence_type', 'gradient_norm'),
-                                'n_clusters_factor': getattr(self.args, 'n_clusters_factor', 0.1),
-                                'num_selected': len(subset_indices)
-                            })
-                    else:
-                        # For other methods (mixed, dpp, submod, rand), get the dpp_weight parameter first
-                        if self.use_learnable_lambda:
-                            # Get class-specific lambda values if multiple classes
-                            unique_classes = np.unique(local_labels)
-                            lambda_values = []
-                            
-                            # Get lambda for each class represented in the batch
-                            for cls in unique_classes:
-                                lambda_val = self.learnable_lambda.get_value(class_idx=cls, epoch=epoch)
-                                lambda_values.append(lambda_val)
-                                
-                            # Use the mean lambda value for this subset
-                            dpp_weight = np.mean(lambda_values)
-                            submod_weight = 1.0 - dpp_weight
-                            
-                            # Log the learned lambda value with detailed metrics
-                            if self.args.use_wandb:
-                                self.learnable_lambda.log_to_wandb(epoch, {
-                                    'training_step': training_step,
-                                    'lambda_applied': dpp_weight,
-                                    'num_classes_in_batch': len(unique_classes),
-                                })
-                            
-                            self.args.logger.info(f"Using learnable lambda: {dpp_weight:.4f} for selection")
-                        else:
-                            # Fallback to adaptive weighting
-                            unique_classes = np.unique(local_labels)
-                            adaptive_weights = []
-                            
-                            # If we have a single class, calculate one weight
-                            if len(unique_classes) == 1:
-                                adaptive_dpp_weight = self._calculate_adaptive_dpp_weight(
-                                    epoch=epoch, 
-                                    class_idx=unique_classes[0], 
-                                    gradients=features
-                                )
-                                adaptive_weights = [adaptive_dpp_weight]
-                            else:
-                                # For multi-class subsets, calculate per-class weights and average them
-                                for cls in unique_classes:
-                                    # Get indices for this class
-                                    cls_indices = np.where(local_labels == cls)[0]
-                                    if len(cls_indices) < 2:  # Need at least 2 samples to compute similarity
-                                        class_weight = self._calculate_adaptive_dpp_weight(epoch=epoch, class_idx=cls)
-                                    else:
-                                        # Calculate using class-specific gradients
-                                        class_weight = self._calculate_adaptive_dpp_weight(
-                                            epoch=epoch,
-                                            class_idx=cls,
-                                            gradients=features[cls_indices]
-                                        )
-                                    adaptive_weights.append(class_weight)
-                            
-                            # Take average of class-specific weights
-                            dpp_weight = np.mean(adaptive_weights) if adaptive_weights else self.base_dpp_weight
-                            submod_weight = 1.0 - dpp_weight
-                            
-                            self.args.logger.info(f"Using adaptive DPP weight: {dpp_weight:.4f} for selection")
-                            
-                            # Log the adaptive weight details
-                            if self.args.use_wandb:
-                                wandb.log({
-                                    'epoch': epoch,
-                                    'training_step': training_step,
-                                    'adaptive_dpp_weight_applied': dpp_weight,
-                                    'num_classes_in_batch': len(unique_classes),
-                                    'min_class_weight': min(adaptive_weights) if adaptive_weights else 0,
-                                    'max_class_weight': max(adaptive_weights) if adaptive_weights else 0
-                                })
-                        
-                        # Call the mixed subset generation with the appropriate selection method and weights
-                        subset_indices, weights = self.subset_generator.generate_mixed_subset(
-                            features=features,  # Gradient features for diversity kernel
-                            labels=local_labels,
-                            softmax_preds=local_softmax,
-                            subset_size=min(self.args.batch_size, len(local_set)),
-                            dpp_weight=dpp_weight,  # Learnable or adaptive λ 
-                            submod_weight=submod_weight,
-                            selection_method=selection_method  # Use the specified selection method
-                        )
-                    
-                    # The rest of the validation and processing remains the same regardless of selection method
-                    # Validate weights - ensure they're normalized and finite
-                    if len(weights) > 0:
-                        if not np.all(np.isfinite(weights)):
-                            self.args.logger.warning("Non-finite weights detected - normalizing")
-                            weights = np.ones_like(weights) / len(weights)
-                        elif np.abs(np.sum(weights) - 1.0) > 1e-5:
-                            self.args.logger.warning("Weights don't sum to 1.0 - normalizing")
-                            weights = weights / np.sum(weights)
-                        
-                    # Map to global indices
-                    subset = local_set[subset_indices]
-                    self.args.logger.info(f"Selection method '{selection_method}' selected {len(subset)} points")
-                    similarity_time = time.time() - time_start  # Measure time for selection
-                else:
-                    # Fall back to legacy selection method
-                    subset, weights, _, similarity_time = self.subset_generator.generate_subset(
-                        preds=gradients,  # Use computed gradients instead of preds
-                        epoch=epoch,
-                        B=min(self.args.batch_size, len(local_set)),  # Don't request more than available
-                        idx=local_set,
-                        targets=self.train_target,
-                        use_submodlib=(self.args.smtk == 0),
-                    )
-                
-                self.similarity_time.update(similarity_time)
-                
-                # Ensure we have valid subsets and weights
-                if len(subset) > 0:
-                    processed_subsets.append(subset)
-                    processed_weights.append(weights)
-                else:
-                    self.args.logger.warning(f"Empty selected subset in local set #{i}")
-            else:
-                self.args.logger.error(f"Invalid prediction shape: {np.shape(preds)}")
-            
-            # Save the updated local set for overall statistics
-            updated_random_sets.append(local_set)
-        
-        # ----------------------------
-        # 7. Update global variables with combined results
-        # ----------------------------
-        # Update global variables after processing, handle empty case
-        if updated_random_sets:
-            # Store only the current random sets, don't append to previous iterations
-            self.random_sets = np.concatenate([rs for rs in updated_random_sets if len(rs) > 0]) if any(len(rs) > 0 for rs in updated_random_sets) else np.array([], dtype=int)
-        else:
-            self.random_sets = np.array([], dtype=int)
-            
-        if processed_subsets:
-            self.subset = np.concatenate(processed_subsets) if processed_subsets else np.array([], dtype=int)
-            self.subset_weights = np.concatenate(processed_weights) if processed_weights else np.array([], dtype=float)
-            
-            # Final safety check on weights
-            if len(self.subset_weights) > 0:
-                if not np.all(np.isfinite(self.subset_weights)):
-                    self.args.logger.warning("Final non-finite weights detected - normalizing")
-                    self.subset_weights = np.ones_like(self.subset_weights) / len(self.subset_weights)
-                elif np.abs(np.sum(self.subset_weights) - 1.0) > 1e-5:
-                    self.args.logger.warning(f"Final weights don't sum to 1.0 (sum={np.sum(self.subset_weights)}) - normalizing")
-                    self.subset_weights = self.subset_weights / np.sum(self.subset_weights)
-        else:
-            self.subset = np.array([], dtype=int)
-            self.subset_weights = np.array([], dtype=float)
-            
-        # Log summary stats
-        total_remaining = len(self.subset)
-        self.args.logger.info(f"Epoch {epoch}: Selected final subset of {total_remaining} instances")
-        
+        # Log to wandb
         if self.args.use_wandb:
             wandb.log({
                 'epoch': epoch,
-                'training_step': training_step,
-                'final_subset_size': total_remaining,
-                'joint_dpp_applied': hasattr(self.subset_generator, 'generate_mixed_subset'),
-                'random_sets_size': len(self.random_sets),
-                'local_sets_processed': len(processed_subsets)
+                'selection_time': selection_time,
+                'subset_size': len(self.subset),
+                'is_refresh_epoch': True
             })
-            
-        return self.subset
-
-    def _calculate_adaptive_dpp_weight(self, epoch: int, class_idx: int = None, gradients=None):
-        """
-        Calculate an adaptive DPP weight that changes based on:
-        1. Training progression (increase diversity as training progresses)
-        2. Class-specific properties (clusters within classes)
-        3. Gradient alignment (increase diversity when gradients become more aligned)
-        
-        :param epoch: Current training epoch
-        :param class_idx: Optional class index for class-specific adaptation
-        :param gradients: Optional gradient features for alignment-based adaptation
-        :return: Adapted DPP weight value between min_dpp_weight and max_dpp_weight
-        """
-        # Initialize with the base weight
-        adaptive_weight = self.base_dpp_weight
-        
-        # Factor 1: Training progression - increase diversity weight over time
-        if hasattr(self.args, 'epochs'):
-            # Normalize epoch to range [0, 1] based on training schedule
-            normalized_epoch = min(1.0, epoch / (self.args.epochs * 0.8))  # Reach max at 80% of training
-            
-            # Apply sigmoid-like scaling to make transition smoother
-            progression_factor = 1.0 / (1.0 + np.exp(-10 * (normalized_epoch - 0.5)))
-            
-            # Scale with configurable rate of change
-            progression_factor *= self.dpp_schedule_factor
-            
-            # Use progression to shift weight toward max_dpp_weight
-            adaptive_weight = self.min_dpp_weight + progression_factor * (self.max_dpp_weight - self.min_dpp_weight)
-        
-        # Factor 2: Class-specific adjustments for cluster density
-        if class_idx is not None and class_idx in self.adaptive_dpp_weights:
-            # Use cached value from previous calculations for this class
-            class_adjustment = self.adaptive_dpp_weights[class_idx]
-            adaptive_weight = 0.7 * adaptive_weight + 0.3 * class_adjustment
-        
-        # Factor 3: Gradient alignment analysis 
-        if gradients is not None and len(gradients) > 1:
-            try:
-                # Calculate pairwise cosine similarity of gradient vectors
-                normalized_grads = gradients / (np.linalg.norm(gradients, axis=1, keepdims=True) + 1e-8)
-                similarities = np.dot(normalized_grads, normalized_grads.T)
-                
-                # Calculate average similarity (higher means more alignment)
-                upper_tri = np.triu_indices_from(similarities, k=1)
-                avg_similarity = np.mean(similarities[upper_tri])
-                
-                # Apply adaptive weight based on similarity
-                # When gradients are highly aligned (avg_similarity close to 1), 
-                # we need more diversity to explore different directions
-                if avg_similarity > self.gradient_alignment_threshold:
-                    alignment_factor = (avg_similarity - self.gradient_alignment_threshold) / (1.0 - self.gradient_alignment_threshold)
-                    alignment_boost = alignment_factor * 0.3  # Max 30% boost from alignment
-                    adaptive_weight = min(self.max_dpp_weight, adaptive_weight + alignment_boost)
-                    
-                    # Cache this value for this class if specified
-                    if class_idx is not None:
-                        self.adaptive_dpp_weights[class_idx] = adaptive_weight
-            except Exception as e:
-                self.args.logger.warning(f"Error calculating gradient similarity: {e}")
-        
-        # Ensure weight stays within bounds
-        adaptive_weight = max(self.min_dpp_weight, min(self.max_dpp_weight, adaptive_weight))
-        
-        # Log the calculated weight if using wandb
-        if self.args.use_wandb:
-            log_data = {
-                'adaptive_dpp_weight': adaptive_weight,
-                'class_idx': class_idx if class_idx is not None else -1,
-                'epoch': epoch
-            }
-            # Add component factors if they were calculated
-            if 'normalized_epoch' in locals():
-                log_data['dpp_progression_factor'] = progression_factor
-            if 'avg_similarity' in locals():
-                log_data['gradient_similarity'] = avg_similarity
-                
-            wandb.log(log_data)
-            
-        return adaptive_weight
-
-    def _eval_epoch(self, epoch: int):
-        """
-        Evaluate the model on the validation set and update learnable lambda
-        """
-        result = super()._eval_epoch(epoch)
-        
-        # Update learnable lambda parameter based on training and validation performance
-        if self.use_learnable_lambda and epoch > 0:
-            # Get training and validation performance metrics
-            train_acc = self.train_acc.avg
-            val_acc = result['val_acc']
-            
-            # Update the learnable lambda parameter
-            self.learnable_lambda.update_with_performance(train_acc, val_acc, epoch)
-            
-            # Log detailed lambda information to wandb
-            if self.args.use_wandb:
-                self.learnable_lambda.log_to_wandb(epoch, {
-                    'train_acc': train_acc,
-                    'val_acc': val_acc,
-                    'train_loss': self.train_loss.avg,
-                    'val_loss': result['val_loss']
-                })
-                
-            # Log the current lambda values
-            lambda_values = self.learnable_lambda.get_all_values()
-            if len(lambda_values) > 1:
-                # Per-class lambdas
-                lambda_str = ", ".join([f"Class {i}: {val:.3f}" for i, val in enumerate(lambda_values)])
-                self.args.logger.info(f"Epoch {epoch} - Learnable lambda values: {lambda_str}")
-            else:
-                # Global lambda
-                self.args.logger.info(f"Epoch {epoch} - Learnable lambda value: {lambda_values[0]:.3f}")
-        
-        return result
 
