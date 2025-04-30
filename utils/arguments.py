@@ -45,7 +45,7 @@ def get_args():
     parser.add_argument("--gamma", type=float, default=0.1, help="learning rate decay parameter")
     parser.add_argument('--seed', default=0, type=int, help="random seed")
     parser.add_argument("--runs", type=int, help="num runs", default=1)
-    parser.add_argument("--warm_start_epochs", default=1, type=int, help="epochs to warm start learning rate") # to 20
+    parser.add_argument("--warm_start_epochs", default=20, type=int, help="epochs to warm start learning rate") # to 20
     parser.add_argument("--subset_start_epoch", default=0, type=int, help="epoch to start subset selection")
 
     # data augmentation options
@@ -73,6 +73,8 @@ def get_args():
         help="use loss times this factor as the loss threshold",)
     parser.add_argument("--shuffle", default=True, type=parse_bool, const=True, nargs='?',
         help="use shuffled minibatch coreset")
+    parser.add_argument("--subset_refresh_frequency", default=5, type=int, 
+        help="subset refresh frequency"),
 
     # random subset options
     parser.add_argument("--random_subset_size", default=0.01, type=float, 

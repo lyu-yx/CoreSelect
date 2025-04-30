@@ -22,6 +22,10 @@ class CRESTTrainer(SubsetTrainer):
         self.steps_per_epoch = np.ceil(int(len(self.train_dataset) * self.args.train_frac) / self.args.batch_size).astype(int)
         self.reset_step = self.steps_per_epoch
 
+        # Set default log_interval if not provided
+        if not hasattr(self.args, 'log_interval'):
+            self.args.log_interval = 10  # Log every 10 batches by default
+
         # Performance metrics
         self.approx_time = AverageMeter()
         self.selection_time = AverageMeter()
@@ -90,21 +94,63 @@ class CRESTTrainer(SubsetTrainer):
         lr = self.lr_scheduler.get_last_lr()[0]
         self.args.logger.info(f"Epoch {epoch} LR {lr:.6f}")
 
+        # Initialize subset for first epoch if not done yet
+        if not hasattr(self, 'subset') or not hasattr(self, 'subset_weights'):
+            subset_size = int(len(self.train_dataset) * self.args.train_frac)
+            subset_size = min(subset_size, self.max_subset_size)
+            self.subset = np.random.choice(self.train_indices, size=subset_size, replace=False)
+            self.subset_weights = np.ones(len(self.subset)) / len(self.subset)
+            self.args.logger.info(f"Initialized random subset with {len(self.subset)} samples for first epoch")
+
         # Only select subset at initial epoch or at fixed refresh intervals
         need_new_subset = (epoch == self.args.warm_start_epochs) or \
                           (epoch >= self.args.warm_start_epochs and 
                            (epoch - self.args.warm_start_epochs) % self.subset_refresh_frequency == 0)
-        if need_new_subset or not hasattr(self, 'current_subset'):
-            # Only select a new subset every refresh interval
+        
+        if need_new_subset:
+            self.args.logger.info(f"Epoch {epoch}: Selecting new subset")
+            selection_start_time = time.time()
             self._select_subset(epoch)
+            selection_end_time = time.time()
+            
+            selection_time = selection_end_time - selection_start_time
+            self.selection_time.update(selection_time)
+            self.args.logger.info(f"Epoch {epoch}: Subset selection took {selection_time:.2f} seconds")
+            
+            if self.args.use_wandb:
+                wandb.log({
+                    'epoch': epoch, 
+                    'subset_selection_time': selection_time,
+                    'subset_size': len(self.subset),
+                    'is_refresh_epoch': True
+                })
+                
+        elif epoch < self.args.warm_start_epochs:
+            # For warm-up epochs, use random subset
+            self.args.logger.info(f"Epoch {epoch}: Warm-up epoch, using random subset")
+            # Random selection with size based on args.train_frac
+            subset_size = int(len(self.train_dataset) * self.args.train_frac)
+            subset_size = min(subset_size, self.max_subset_size)
+            self.subset = np.random.choice(self.train_indices, size=subset_size, replace=False)
+            self.subset_weights = np.ones(len(self.subset)) / len(self.subset)
+        
+        # Set up current subset cache
+        if not hasattr(self, 'current_subset') or not hasattr(self, 'current_weights'):
             self.current_subset = self.subset.copy()
             self.current_weights = self.subset_weights.copy()
         else:
-            # Always reuse the cached subset and weights
-            self.subset = self.current_subset.copy()
-            self.subset_weights = self.current_weights.copy()
+            # Only update current subset if we've selected a new one
+            if need_new_subset or epoch < self.args.warm_start_epochs:
+                self.current_subset = self.subset.copy()
+                self.current_weights = self.subset_weights.copy()
+            else:
+                # Reuse cached subset from previous epoch
+                self.subset = self.current_subset.copy()
+                self.subset_weights = self.current_weights.copy()
+                
+        # Always update the dataloader with the final subset
         self._update_train_loader_and_weights()
-
+        
         # Training loop
         num_batches = len(self.train_loader)
         if num_batches == 0:
@@ -121,6 +167,9 @@ class CRESTTrainer(SubsetTrainer):
             self.batch_data_time.update(data_time)
             
             # Forward and backward pass with potential mixed precision
+            data = data.to(self.args.device, non_blocking=True)
+            target = target.to(self.args.device, non_blocking=True)
+            
             loss, train_acc = self._forward_and_backward(data, target, data_idx)
             
             # Log progress periodically
