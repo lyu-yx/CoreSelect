@@ -553,24 +553,39 @@ class SubsetGenerator:
             lambdaVal=1.0  # Regularization parameter within log det
         )
         
-        # Create combined objective with weighted diversity
-        # Following F(S) = f(S) + λD(S)
-        from submodlib.functions.mixture import MixtureFunction
+        # MixtureFunction is not implemented, use custom implementation instead
+        print("Using custom implementation for joint optimization")
         
-        # Define the mixture with weights: (1-dpp_weight) for coverage, dpp_weight for diversity
-        mixture_obj = MixtureFunction(
-                        functions=[fl_obj, dpp_obj],
-            weights=[(1-dpp_weight), dpp_weight]
-        )
+        # Perform greedy optimization of the joint objective manually
+        selected_indices = []
+        remaining = list(range(len(similarity_matrix)))
         
-        # Perform greedy optimization of the joint objective
-        selected_indices = mixture_obj.maximize(
-            budget=size,
-            optimizer="LazyGreedy",
-            stopIfZeroGain=False,
-            stopIfNegativeGain=False,
+        for _ in range(min(size, len(similarity_matrix))):
+            if not remaining:
+                break
+                
+            best_idx = -1
+            best_gain = float('-inf')
+            
+            for idx in remaining:
+                # Calculate gains
+                fl_gain = fl_obj.marginalGain(selected_indices, idx)
+                dpp_gain = dpp_obj.marginalGain(selected_indices, idx)
+                
+                # Combined gain with weighted components
+                combined_gain = (1-dpp_weight) * fl_gain + dpp_weight * dpp_gain
+                
+                if combined_gain > best_gain:
+                    best_gain = combined_gain
+                    best_idx = idx
+                    
+            if best_idx >= 0:
+                selected_indices.append(best_idx)
+                remaining.remove(best_idx)
+            else:
+                break
             verbose=False
-        )
+        
         
         indices = np.array(selected_indices)
         

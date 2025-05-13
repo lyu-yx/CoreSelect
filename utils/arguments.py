@@ -73,7 +73,7 @@ def get_args():
         help="use loss times this factor as the loss threshold",)
     parser.add_argument("--shuffle", default=True, type=parse_bool, const=True, nargs='?',
         help="use shuffled minibatch coreset")
-    parser.add_argument("--subset_refresh_frequency", default=5, type=int, 
+    parser.add_argument("--subset_refresh_frequency", default=20, type=int, 
         help="subset refresh frequency"),
 
     # random subset options
