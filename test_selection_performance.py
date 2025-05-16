@@ -59,27 +59,7 @@ def main():
         print("Standard implementation not available.")
         standard_time = float('inf')
     
-    # Run optimized implementation
-    try:
-        from utils.optimized_selection import get_orders_and_weights_optimized
-        
-        start_time = time.time()
-        order_mg, weights_mg, _, _, _, _ = get_orders_and_weights_optimized(
-            B=target_size,
-            X=features,
-            metric="cosine",
-            y=labels,
-            dpp_weight=args.dpp_weight,
-            verbose=True
-        )
-        optimized_time = time.time() - start_time
-        
-        print(f"Optimized implementation: selected {len(order_mg)} samples in {optimized_time:.2f}s")
-        
-        if standard_time != float('inf'):
-            print(f"Speedup: {standard_time / optimized_time:.2f}x")
-    except ImportError:
-        print("Optimized implementation not available.")
+
     
 if __name__ == "__main__":
     main()

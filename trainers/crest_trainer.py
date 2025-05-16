@@ -131,7 +131,7 @@ class CRESTTrainer(SubsetTrainer):
             subset_size = int(len(self.train_dataset) * self.args.train_frac)
             subset_size = min(subset_size, self.max_subset_size)
             self.subset = np.random.choice(self.train_indices, size=subset_size, replace=False)
-            self.subset_weights = np.ones(len(self.subset)) / len(self.subset)
+            self.subset_weights = np.ones(len(self.subset))
         
         # Set up current subset cache
         if not hasattr(self, 'current_subset') or not hasattr(self, 'current_weights'):
@@ -194,539 +194,62 @@ class CRESTTrainer(SubsetTrainer):
             # Start timing next data loading
             data_start = time.time()
     
-    def _get_train_output_efficient(self, indices=None):
-        """
-        Efficiently compute model outputs for given indices with batching and parallel processing
-        
-        :param indices: Indices to compute outputs for (if None, compute for all data)
-        """
-        self.model.eval()
-        
-        # Determine which indices to process
-        if indices is None:
-            indices_to_process = self.train_indices
-        else:
-            indices_to_process = indices
-            
-        # Create dataset and dataloader for efficient processing
-        eval_dataset = Subset(self.train_dataset, indices_to_process)
-        eval_loader = DataLoader(
-            eval_dataset,
-            batch_size=self.inference_batch_size,  # Larger batch size for inference
-            shuffle=False,
-            num_workers=min(self.args.num_workers * 2, 16),  # More workers for inference
-            pin_memory=True
-        )
-        
-        # Initialize arrays if they don't exist
-        if not hasattr(self, 'train_output') or self.train_output.shape[0] != len(self.train_dataset):
-            self.train_output = np.zeros((len(self.train_dataset), self.args.num_classes))
-            self.train_softmax = np.zeros((len(self.train_dataset), self.args.num_classes))
-        
-        # Process batches in parallel if possible
-        with torch.no_grad():
-            for data, _, data_idx in eval_loader:
-                data = data.to(self.args.device, non_blocking=True)
-                
-                # Use mixed precision for faster inference
-                if self.use_mixed_precision:
-                    with torch.cuda.amp.autocast():
-                        output = self.model(data)
-                else:
-                    output = self.model(data)
-                
-                # Compute softmax efficiently on GPU before transferring to CPU
-                softmax_output = F.softmax(output, dim=1)
-                
-                # Update arrays
-                self.train_output[data_idx] = output.cpu().numpy()
-                self.train_softmax[data_idx] = softmax_output.cpu().numpy()
-        
-        self.model.train()
-        
-    def _select_coreset(self, pool_indices, epoch: int):
-        """
-        Helper method to select a coreset within a single selection step.
-        This method is optimized to run only when needed.
-        """
-        print(f"Starting coreset selection for pool of {len(pool_indices)} samples")
-        
-        # Determine target subset size
-        target_subset_size = int(len(self.train_dataset) * self.args.train_frac)
 
-        # Get predictions and targets for candidate pool
-        preds = self.train_softmax[pool_indices]
-        targets = self.train_target[pool_indices]
-        
-        # Calculate gradient features for selection
-        one_hot_labels = np.zeros((len(targets), self.args.num_classes))
-        one_hot_labels[np.arange(len(targets)), targets] = 1
-        gradients = preds - one_hot_labels  # Gradient of cross-entropy w.r.t logits
-        
-        # Perform selection using mixed method
-        selection_method = getattr(self.args, 'selection_method', 'mixed')
-        
-        # Use internal selection implementation to prevent multiple calls to subset_generator
-        # This addresses the issue of multiple selection logs in the output
-        if len(pool_indices) > 10000 and selection_method == "mixed":
-            subset_indices, weights = self._internal_mixed_selection(
-                gradients, targets, preds, target_subset_size
-            )
-        else:
-            # Use internal selection method directly without going through the SubsetGenerator
-            # to avoid unnecessary logging
-            subset_indices, weights = self._internal_mixed_selection(
-                gradients, 
-                targets, 
-                preds, 
-                target_subset_size
-            )
-        
-        # Map local indices back to global
-        global_indices = pool_indices[subset_indices]
-        return global_indices, weights
-        
-    def _internal_mixed_selection(self, features, labels, softmax_preds, subset_size):
+    def _select_subset(self, epoch: int, training_step: int = None):
         """
-        Internal mixed selection implementation to avoid multiple calls to subset_generator
-        This ensures we don't log the selection process multiple times
+        Overridden from the parent class to ensure our implementation is used
+        and to prevent multiple subset selections
         """
-        start_time = time.time()
         
-        # Process by class for better efficiency
-        classes = np.unique(labels)
-        class_counts = [np.sum(labels == c) for c in classes]
-        class_fractions = np.array(class_counts) / len(labels)
+        # Configure the subset generator to be aware of the refresh frequency
+        if hasattr(self.subset_generator, 'set_refresh_frequency'):
+            self.subset_generator.set_refresh_frequency(self.subset_refresh_frequency)
+            self.subset_generator.set_epoch(epoch)
+            
+        # Force a refresh since we know we need one
+        if hasattr(self.subset_generator, 'force_selection_refresh'):
+            self.subset_generator.force_selection_refresh()
+            
+        # Increment selection counter (for compatibility with parent class)
+        self.num_selection += 1
         
-        # Calculate target size per class
-        targets_per_class = np.int32(np.ceil(class_fractions * subset_size))
-        
-        # Ensure we don't select more than subset_size
-        while np.sum(targets_per_class) > subset_size:
-            idx_to_reduce = np.argmax(targets_per_class)
-            targets_per_class[idx_to_reduce] -= 1
-        
-        class_prep_time = time.time() - start_time
-        
-        # Try to use the fast implementation first
-        try:
-            indices, weights = self._fast_mixed_selection(features, labels, softmax_preds, targets_per_class, classes)
-            total_time = time.time() - start_time
+        if self.args.use_wandb:
+            wandb.log({"epoch": epoch, "training_step": training_step, "num_selection": self.num_selection})
             
-            # Log timing information
-            print(f"Fast mixed selection performance breakdown:")
-            print(f"  - Total time: {total_time:.2f}s")
-            print(f"  - Class preparation: {class_prep_time:.2f}s ({class_prep_time/total_time*100:.1f}%)")
+        # Handle dataset caching (from parent class)
+        if self.args.cache_dataset:
+            self.train_dataset.clean()
+            self.train_dataset.cache()
             
-            return indices, weights
-            
-        except Exception as e:
-            self.args.logger.warning(f"Fast selection failed with error: {e}. Falling back to standard implementation.")
-            
-            # If fast implementation fails, use the original implementation as fallback
-            # Selection per class (no logging)
-            all_indices = []
-            all_weights = []
-            
-            total_similarity_time = 0
-            total_greedy_selection_time = 0
-            total_batch_processing_time = 0
-            
-            for c_idx, cls in enumerate(classes):
-                class_start_time = time.time()
-                
-                target_size = targets_per_class[c_idx]
-                if target_size <= 0:
-                    continue
-                    
-                class_mask = (labels == cls)
-                class_indices = np.where(class_mask)[0]
-                if len(class_indices) == 0:
-                    continue
-                    
-                # Extract class features and normalize
-                class_features = features[class_indices]
-                norms = np.linalg.norm(class_features, axis=1, keepdims=True)
-                norms[norms == 0] = 1.0
-                normalized_features = class_features / norms
-                
-                # Compute similarity matrix
-                similarity_start = time.time()
-                similarity_matrix = np.dot(normalized_features, normalized_features.T)
-                similarity_time = time.time() - similarity_start
-                total_similarity_time += similarity_time
-                
-                # Greedy selection
-                greedy_start = time.time()
-                selected = []
-                remaining = list(range(len(class_indices)))
-                
-                # Select first element based on representation
-                if remaining:
-                    row_sums = np.sum(similarity_matrix, axis=1)
-                    best_idx = np.argmax(row_sums)
-                    selected.append(best_idx)
-                    remaining.remove(best_idx)
-                
-                # Select remaining elements
-                for _ in range(min(target_size - 1, len(class_indices) - 1)):
-                    if not remaining:
-                        break
-                        
-                    best_idx = -1
-                    best_gain = -float('inf')
-                    
-                    # Set batch size dynamically based on number of remaining samples
-                    # instead of hardcoded 1000
-                    batch_size = min(len(remaining) // 10 + 1, len(remaining))
-                    
-                    batch_start = time.time()
-                    for i in range(0, len(remaining), batch_size):
-                        batch = remaining[i:min(i + batch_size, len(remaining))]
-                        
-                        # Compute coverage and diversity scores
-                        coverage_sims = similarity_matrix[batch, :]
-                        coverage_scores = np.sum(coverage_sims, axis=1)
-                        
-                        if selected:
-                            diversity_penalty = np.max(similarity_matrix[batch, :][:, selected], axis=1)
-                        else:
-                            diversity_penalty = np.zeros(len(batch))
-                        
-                        # Combined score with weighted diversity
-                        combined_scores = (1.0 - self.dpp_weight) * coverage_scores - self.dpp_weight * diversity_penalty
-                        
-                        # Find best element
-                        batch_best_idx = np.argmax(combined_scores)
-                        batch_best_gain = combined_scores[batch_best_idx]
-                        
-                        if batch_best_gain > best_gain:
-                            best_gain = batch_best_gain
-                            best_idx = batch[batch_best_idx]
-                    
-                    if best_idx != -1:
-                        selected.append(best_idx)
-                        remaining.remove(best_idx)
-                        
-                    batch_time = time.time() - batch_start
-                    total_batch_processing_time += batch_time
-                
-                greedy_selection_time = time.time() - greedy_start
-                total_greedy_selection_time += greedy_selection_time
-                
-                # Calculate weights and map indices
-                if selected:
-                    row_sums = np.sum(similarity_matrix[selected, :], axis=1)
-                    class_weights = row_sums / np.sum(row_sums)
-                    
-                    # Convert to global indices
-                    global_indices = [class_indices[idx] for idx in selected]
-                    
-                    all_indices.extend(global_indices)
-                    all_weights.extend(class_weights)
-                    
-                class_time = time.time() - class_start_time
-                if len(class_indices) > 100:  # Only log for significant classes
-                    self.args.logger.debug(f"Class {cls}: {len(class_indices)} samples -> {len(selected)} selected in {class_time:.2f}s")
-                    self.args.logger.debug(f"  - Similarity matrix: {similarity_time:.2f}s")
-                    self.args.logger.debug(f"  - Greedy selection: {greedy_selection_time:.2f}s")
-            
-            # Convert to numpy arrays
-            indices = np.array(all_indices, dtype=np.int32)
-            weights = np.array(all_weights, dtype=np.float32)
-            
-            # Normalize weights
-            if len(weights) > 0:
-                weights = weights / np.sum(weights)
-                
-            total_time = time.time() - start_time
-            
-            # Log timing information
-            print(f"Mixed selection performance breakdown:")
-            print(f"  - Total time: {total_time:.2f}s")
-            print(f"  - Class preparation: {class_prep_time:.2f}s ({class_prep_time/total_time*100:.1f}%)")
-            print(f"  - Similarity matrix computation: {total_similarity_time:.2f}s ({total_similarity_time/total_time*100:.1f}%)")
-            print(f"  - Greedy selection: {total_greedy_selection_time:.2f}s ({total_greedy_selection_time/total_time*100:.1f}%)")
-            print(f"  - Batch processing: {total_batch_processing_time:.2f}s ({total_batch_processing_time/total_time*100:.1f}%)")
-                
-            return indices, weights
-            
-        except (ImportError, AttributeError) as e:
-            # Fall back to simpler implementation if submodlib is not available
-            print(f"Error importing submodlib: {e}")
-            raise ImportError("Submodlib library is not available for mixed selection") from e
-
-    def _fast_mixed_selection(self, features, labels, softmax_preds, targets_per_class, classes):
-        """
-        Fast implementation of mixed selection using submodlib, inspired by
-        facility_location_order implementation
-        
-        Args:
-            features: Feature vectors for samples
-            labels: Class labels
-            softmax_preds: Model predictions
-            targets_per_class: Number of samples to select per class
-            classes: Unique class labels
-            
-        Returns:
-            Tuple of (selected indices, selection weights)
-        """
-        try:
-            from submodlib import FacilityLocationFunction, LogDeterminantFunction
-            print(f"Implementing optimized selection with combined objectives")
-            
-            # Normalize features for similarity computation
-            norms = np.linalg.norm(features, axis=1, keepdims=True)
-            norms[norms == 0] = 1.0
-            normalized_features = features / norms
-            
-            # Track execution time
-            fast_start_time = time.time()
-            
-            # Process each class sequentially
-            all_indices = []
-            all_weights = []
-            
-            # Process each class
-            for c_idx, cls in enumerate(classes):
-                target_size = targets_per_class[c_idx]
-                if target_size <= 0:
-                    continue
-                    
-                class_mask = (labels == cls)
-                class_indices = np.where(class_mask)[0]
-                
-                if len(class_indices) == 0 or target_size == 0:
-                    continue
-                    
-                # Extract class features
-                class_features = normalized_features[class_indices]
-                
-                # Determine if we should use dense or sparse mode based on dataset size
-                use_dense = len(class_indices) <= 10000
-                
-                # For mixed objective, we need to handle separately based on computation mode
-                if use_dense:
-                    # Compute similarity matrix for dense mode
-                    similarity_matrix = np.dot(class_features, class_features.T)
-                    
-                    # Create facility location object for coverage
-                    fl_obj = FacilityLocationFunction(
-                        n=len(class_features),
-                        mode="dense",
-                        sijs=similarity_matrix,
-                        separate_rep=False
-                    )
-                    
-                    # Create log determinant object for diversity
-                    dpp_obj = LogDeterminantFunction(
-                        n=len(class_features),
-                        mode="dense",
-                        sijs=similarity_matrix,
-                        lambdaVal=1.0
-                    )
-                else:
-                    # For sparse mode, use data directly
-                    fl_obj = FacilityLocationFunction(
-                        n=len(class_features),
-                        mode="sparse",
-                        data=class_features,
-                        metric="cosine",
-                        num_neighbors=128
-                    )
-                    
-                    dpp_obj = LogDeterminantFunction(
-                        n=len(class_features),
-                        mode="sparse",
-                        data=class_features,
-                        metric="cosine"
-                    )
-                
-                # Use direct maximize approach for better performance
-                print(f"Using efficient maximize approach with diversity weight {self.dpp_weight}")
-                
-                # If using pure facility location (no diversity)
-                if self.dpp_weight <= 0:
-                    # Use the built-in maximize for FacilityLocationFunction which is highly optimized
-                    start_time = time.time()
-                    greedyList = fl_obj.maximize(
-                        budget=target_size,
-                        optimizer="LazyGreedy",
-                        stopIfZeroGain=False,
-                        stopIfNegativeGain=False,
-                        verbose=False
-                    )
-                    selection_time = time.time() - start_time
-                    print(f"Pure FL maximize completed in {selection_time:.3f}s")
-                    
-                    # Extract selected indices and gains
-                    selected = [x[0] for x in greedyList]
-                    
-                else:
-                    # Use maximizer directly for both FL and DPP objectives
-                    start_time = time.time()
-                    
-                    # Get FL order using efficient C++ implementation
-                    fl_greedyList = fl_obj.maximize(
-                        budget=target_size,
-                        optimizer="LazyGreedy",
-                        stopIfZeroGain=False,
-                        stopIfNegativeGain=False,
-                        verbose=False
-                    )
-                    fl_order = [x[0] for x in fl_greedyList]
-                    fl_gains = [x[1] for x in fl_greedyList]
-                    
-                    # Get DPP order using efficient C++ implementation
-                    dpp_greedyList = dpp_obj.maximize(
-                        budget=target_size,
-                        optimizer="LazyGreedy",
-                        stopIfZeroGain=False,
-                        stopIfNegativeGain=False,
-                        verbose=False
-                    )
-                    dpp_order = [x[0] for x in dpp_greedyList]
-                    dpp_gains = [x[1] for x in dpp_greedyList]
-                    
-                    # Combine the two orders with weighted gains
-                    selected = []
-                    curr_set = set()
-                    fl_idx = 0
-                    dpp_idx = 0
-                    
-                    # Interleave FL and DPP selections based on weighted gains
-                    while len(selected) < target_size and (fl_idx < len(fl_order) or dpp_idx < len(dpp_order)):
-                        # Skip elements already selected
-                        while fl_idx < len(fl_order) and fl_order[fl_idx] in curr_set:
-                            fl_idx += 1
-                        while dpp_idx < len(dpp_order) and dpp_order[dpp_idx] in curr_set:
-                            dpp_idx += 1
-                            
-                        # Check if we've exhausted either list
-                        if fl_idx >= len(fl_order):
-                            if dpp_idx < len(dpp_order) and dpp_order[dpp_idx] not in curr_set:
-                                next_idx = dpp_order[dpp_idx]
-                                dpp_idx += 1
-                            else:
-                                break
-                        elif dpp_idx >= len(dpp_order):
-                            if fl_idx < len(fl_order) and fl_order[fl_idx] not in curr_set:
-                                next_idx = fl_order[fl_idx]
-                                fl_idx += 1
-                            else:
-                                break
-                        else:
-                            # Both lists have candidates - compare weighted gains
-                            fl_weighted = (1 - self.dpp_weight) * fl_gains[fl_idx]
-                            dpp_weighted = self.dpp_weight * dpp_gains[dpp_idx]
-                            
-                            if fl_weighted > dpp_weighted:
-                                next_idx = fl_order[fl_idx]
-                                fl_idx += 1
-                            else:
-                                next_idx = dpp_order[dpp_idx]
-                                dpp_idx += 1
-                        
-                        # Add the selected element
-                        if next_idx not in curr_set:
-                            selected.append(next_idx)
-                            curr_set.add(next_idx)
-                    
-                    selection_time = time.time() - start_time
-                    print(f"Joint maximize completed in {selection_time:.3f}s using efficient maximizer")
-                
-                # Convert selected list to numpy array for efficient indexing
-                selected = np.array(list(selected))
-                
-                # Compute similarity matrix for computing cluster sizes
-                if len(selected) > 0:
-                    # Get the precomputed similarity matrix if we're in dense mode
-                    if use_dense:
-                        sim_to_selected = similarity_matrix[:, selected]
-                    else:
-                        # Compute similarity matrix only for selected points
-                        sel_features = class_features[selected]
-                        sim_to_selected = fl_obj.sijs[:, selected]  # Use precomputed similarities from FL object
-                    
-                    # For each point, find most similar selected point
-                    closest_selected = np.argmax(sim_to_selected, axis=1)
-                    
-                    # Count points belonging to each cluster
-                    cluster_sizes = np.zeros(len(selected))
-                    class_weights = None  # Can add sample weighting here if needed
-                    
-                    for i in range(len(class_features)):
-                        if np.max(sim_to_selected[i]) > 0:  # Only count if similarity > 0
-                            cluster_sizes[closest_selected[i]] += 1 if class_weights is None else class_weights[i]
-                    
-                    # Ensure no zero weights
-                    cluster_sizes[cluster_sizes == 0] = 1
-                    
-                    # Map local indices back to global indices
-                    global_indices = class_indices[selected]
-                    
-                    if len(global_indices) > 0:
-                        all_indices.extend(global_indices)
-                        all_weights.extend(cluster_sizes)
-            
-            # Convert to numpy arrays with proper types
-            indices = np.array(all_indices, dtype=np.int32)
-            weights = np.array(all_weights, dtype=np.float32)
-            
-            # Skip normalization for better stability
-            # if len(weights) > 0:
-            #     weights = weights / np.sum(weights)
-            
-            fast_selection_time = time.time() - fast_start_time
-            print(f"Fast mixed selection completed in {fast_selection_time:.2f}s, selected {len(indices)} samples")
-                
-            return indices, weights
-            
-        except (ImportError, AttributeError) as e:
-            # Fall back to simpler implementation if submodlib is not available
-            print(f"Error importing submodlib: {e}")
-            raise ImportError("Submodlib library is not available for mixed selection") from e
-
-    def _select_subset_impl(self, epoch: int):
-        """
-        Select a high-quality subset of training data, optimized for efficiency
-        
-        :param epoch: Current epoch
-        """
+        # Use our optimized subset selection
         selection_start = time.time()
+        
+        # Implementation of optimized subset selection (formerly _select_subset_impl)
         self.args.logger.info(f"Epoch {epoch}: Starting optimized subset selection")
         
         # Determine target subset size
         target_subset_size = int(len(self.train_dataset) * self.args.train_frac)
-        target_subset_size = min(target_subset_size, self.max_subset_size)
         
-        # Use cached outputs if available from recent epochs to save computation
-        use_cached = (epoch - self.cached_epoch <= 2) and hasattr(self, 'cached_pool_indices')
         
-        if not use_cached:
-            # Determine if we should sample based on dataset size
-            # For large datasets, use sampling to speed up computation
-            dataset_size = len(self.train_dataset)
-            large_dataset_threshold = dataset_size  # Consider 25% of dataset size as threshold
-            
-            if dataset_size > large_dataset_threshold:
-                # Sample size proportional to dataset size but capped
-                sample_size = min(dataset_size, 50000)
-                sample_indices = self._select_stratified_random(self.train_indices, sample_size)
-                self._get_train_output_efficient(indices=sample_indices)
-                pool_indices = sample_indices
-            else:
-                # For smaller datasets, compute on the entire dataset
-                self._get_train_output_efficient()
-                pool_indices = self.train_indices
-                
-            # Cache the results
-            self.cached_pool_indices = pool_indices
-            self.cached_epoch = epoch
+        # Determine if we should sample based on dataset size
+        # For large datasets, use sampling to speed up computation
+        dataset_size = len(self.train_dataset)
+        large_dataset_threshold = dataset_size 
+        
+        if dataset_size > large_dataset_threshold:
+            # Sample size proportional to dataset size but capped
+            sample_size = min(dataset_size, 50000)
+            sample_indices = self._select_stratified_random(self.train_indices, sample_size)
+            self._get_train_output_efficient(indices=sample_indices)
+            pool_indices = sample_indices
         else:
-            # Use cached data
-            self.args.logger.info(f"Using cached model outputs from epoch {self.cached_epoch}")
-            pool_indices = self.cached_pool_indices
+            # For smaller datasets, compute on the entire dataset
+            self._get_train_output_efficient()
+            pool_indices = self.train_indices
+            
+
+        # Use cached data
+        self.args.logger.info(f"Using cached model outputs from epoch {self.cached_epoch}")
         
         try:
             # Use optimized selection
@@ -780,47 +303,7 @@ class CRESTTrainer(SubsetTrainer):
             f"Total selection time: {total_selection_time:.2f}s"
         )
         
-        if self.args.use_wandb:
-            wandb.log({
-                'epoch': epoch,
-                'total_selection_time': total_selection_time,
-                'final_subset_size': len(self.subset),
-                'dpp_weight': self.dpp_weight,
-                'subset_fraction': len(self.subset)/len(self.train_dataset)
-            })
-            
-    # Override the parent class method to prevent call from SubsetTrainer
-    def _select_subset(self, epoch: int, training_step: int = None):
-        """
-        Overridden from the parent class to ensure our implementation is used
-        and to prevent multiple subset selections
-        """
-        
-        # Configure the subset generator to be aware of the refresh frequency
-        if hasattr(self.subset_generator, 'set_refresh_frequency'):
-            self.subset_generator.set_refresh_frequency(self.subset_refresh_frequency)
-            self.subset_generator.set_epoch(epoch)
-            
-        # Force a refresh since we know we need one
-        if hasattr(self.subset_generator, 'force_selection_refresh'):
-            self.subset_generator.force_selection_refresh()
-            
-        # Increment selection counter (for compatibility with parent class)
-        self.num_selection += 1
-        
-        if self.args.use_wandb:
-            wandb.log({"epoch": epoch, "training_step": training_step, "num_selection": self.num_selection})
-            
-        # Handle dataset caching (from parent class)
-        if self.args.cache_dataset:
-            self.train_dataset.clean()
-            self.train_dataset.cache()
-            
-        # Use our optimized subset selection
-        selection_start = time.time()
-        self._select_subset_impl(epoch)
         selection_time = time.time() - selection_start
-        
         self.args.logger.info(f"Epoch {epoch}: Complete subset selection took {selection_time:.2f} seconds")
         
         # Log to wandb
@@ -829,6 +312,372 @@ class CRESTTrainer(SubsetTrainer):
                 'epoch': epoch,
                 'selection_time': selection_time,
                 'subset_size': len(self.subset),
-                'is_refresh_epoch': True
+                'is_refresh_epoch': True,
+                'total_selection_time': total_selection_time,
+                'final_subset_size': len(self.subset),
+                'dpp_weight': self.dpp_weight,
+                'subset_fraction': len(self.subset)/len(self.train_dataset)
             })
+            
+    
+        
+    def _select_coreset(self, pool_indices, epoch: int):
+        """
+        Helper method to select a coreset within a single selection step.
+        This method is optimized to run only when needed.
+        """
+        print(f"Starting coreset selection for pool of {len(pool_indices)} samples")
+        
+        # Determine target subset size
+        target_subset_size = int(len(self.train_dataset) * self.args.train_frac)
 
+        # Get predictions and targets for candidate pool
+        preds = self.train_softmax[pool_indices]
+        targets = self.train_target[pool_indices]
+        
+        # Calculate gradient features for selection
+        one_hot_labels = np.zeros((len(targets), self.args.num_classes))
+        one_hot_labels[np.arange(len(targets)), targets] = 1
+        gradients = preds - one_hot_labels  # Gradient of cross-entropy w.r.t logits
+        
+        # Perform selection using mixed method
+        selection_method = getattr(self.args, 'selection_method', 'mixed')
+        
+        # Use internal selection implementation to prevent multiple calls to subset_generator
+        # This addresses the issue of multiple selection logs in the output
+        if selection_method == "mixed":
+            # Internal mixed selection implementation 
+            start_time = time.time()
+            
+            # Process by class for better efficiency
+            classes = np.unique(targets)
+            class_counts = [np.sum(targets == c) for c in classes]
+            class_fractions = np.array(class_counts) / len(targets)
+            
+            # Calculate target size per class
+            targets_per_class = np.int32(np.ceil(class_fractions * target_subset_size))
+            
+            # Ensure we don't select more than subset_size
+            while np.sum(targets_per_class) > target_subset_size:
+                idx_to_reduce = np.argmax(targets_per_class)
+                targets_per_class[idx_to_reduce] -= 1
+            
+            class_prep_time = time.time() - start_time
+            
+            # Try to use the simplified facility location implementation
+            try:
+                subset_indices, weights = self._fast_mixed_selection(gradients, targets, preds, targets_per_class, classes)
+                total_time = time.time() - start_time
+                
+                # Log timing information
+                print(f"Selection performance breakdown:")
+                print(f"  - Total time: {total_time:.2f}s")
+                print(f"  - Class preparation: {class_prep_time:.2f}s ({class_prep_time/total_time*100:.1f}%)")
+                
+            except Exception as e:
+                self.args.logger.warning(f"Selection failed with error: {str(e)}")
+                self.args.logger.warning("Error details:", exc_info=True)
+                print(f"Error with _select_coreset: {str(e)}")
+                
+                # Fallback to random selection
+                subset_indices = np.random.choice(
+                    np.arange(len(pool_indices)), 
+                    size=min(target_subset_size, len(pool_indices)),
+                    replace=False
+                )
+                weights = np.ones(len(subset_indices))
+                
+        # TODO: Implement other selection methods if needed
+        else:
+            # Fallback to random subset selection if method is not implemented
+            self.args.logger.warning(f"Selection method '{selection_method}' not implemented. Using random selection.")
+            
+            # Generate random subset
+            subset_indices = np.random.choice(
+                np.arange(len(pool_indices)), 
+                size=min(target_subset_size, len(pool_indices)),
+                replace=False
+            )
+            weights = np.ones(len(subset_indices))
+        
+        # Map local indices back to global
+        global_indices = pool_indices[subset_indices]
+        return global_indices, weights
+
+    def _fast_mixed_selection(self, features, labels, softmax_preds, targets_per_class, classes):
+        """
+        Improved implementation of mixed selection using a two-stage approach:
+        1. Select a larger intermediate subset based on coverage
+        2. Cluster similar instances and reduce to the final subset
+        
+        Args:
+            features: Feature vectors for samples
+            labels: Class labels
+            softmax_preds: Model predictions
+            targets_per_class: Number of samples to select per class
+            classes: Unique class labels
+            
+        Returns:
+            Tuple of (selected indices, selection weights)
+        """
+        try:
+            from submodlib import FacilityLocationFunction, LogDeterminantFunction
+            from sklearn.cluster import AgglomerativeClustering
+            import scipy.spatial.distance as distance
+            
+            print(f"Implementing two-stage selection for coverage + diversity")
+            
+            # Track execution time
+            start_time = time.time()
+            
+            # Normalize features for similarity computation
+            norms = np.linalg.norm(features, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            normalized_features = features / norms
+            
+            # Process each class separately
+            all_selected_indices = []
+            all_selected_weights = []
+            
+            for c_idx, cls in enumerate(classes):
+                target_class_size = targets_per_class[c_idx]
+                if target_class_size <= 0:
+                    continue
+                
+                # Get class-specific data
+                class_mask = (labels == cls)
+                class_indices = np.where(class_mask)[0]
+                
+                if len(class_indices) == 0:
+                    continue
+                
+                if len(class_indices) <= target_class_size:
+                    # If we have fewer samples than target, use all available
+                    all_selected_indices.extend(class_indices)
+                    all_selected_weights.extend(np.ones(len(class_indices)))
+                    continue
+                
+                # Extract class features
+                class_features = normalized_features[class_indices]
+                n_samples = len(class_features)
+                
+                # STAGE 1: Initial coverage-based selection (facility location)
+                # Select larger intermediate subset (2x target size, but capped)
+                intermediate_size = min(n_samples, int(target_class_size * 2))
+                
+                # Use dense mode for smaller datasets, sparse for larger ones
+                use_dense = n_samples <= 5000  # Threshold adjusted for performance
+                mode = "dense" if use_dense else "sparse"
+                
+                # Create facility location object
+                fl_time_start = time.time()
+                try:
+                    if use_dense:
+                        # For dense mode, precompute similarity matrix
+                        similarity_matrix = np.dot(class_features, class_features.T)
+                        fl_obj = FacilityLocationFunction(
+                            n=n_samples,
+                            mode="dense",
+                            sijs=similarity_matrix,
+                            separate_rep=False
+                        )
+                    else:
+                        # For sparse mode, let submodlib compute similarities as needed
+                        fl_obj = FacilityLocationFunction(
+                            n=n_samples,
+                            mode="sparse",
+                            data=class_features,
+                            metric="cosine",
+                            num_neighbors=min(128, n_samples - 1)
+                        )
+                        
+                    fl_prep_time = time.time() - fl_time_start
+                    
+                    # Run lazy greedy selection
+                    greedy_start = time.time()
+                    intermediate_greedy_list = fl_obj.maximize(
+                        budget=intermediate_size,
+                        optimizer="LazyGreedy",
+                        stopIfZeroGain=False,
+                        stopIfNegativeGain=False,
+                        verbose=False
+                    )
+                    greedy_time = time.time() - greedy_start
+                    
+                    # Extract the initial selected points
+                    intermediate_selected = [x[0] for x in intermediate_greedy_list]
+                    intermediate_selected = np.array(intermediate_selected, dtype=np.int32)
+                    
+                    # Get similarity matrix for selected points
+                    if use_dense:
+                        # Already computed
+                        S = similarity_matrix
+                    else:
+                        # Use the similarity matrix from facility location
+                        S = fl_obj.sijs
+                        
+                    # STAGE 2: Redundancy reduction through clustering
+                    # If we have more than target size after initial selection
+                    if len(intermediate_selected) > target_class_size:
+                        cluster_start = time.time()
+                        
+                        # Extract features for initially selected points
+                        selected_features = class_features[intermediate_selected]
+                        
+                        # Compute similarity/distance matrix for clustering
+                        if len(intermediate_selected) <= 1000:
+                            # Direct approach for smaller datasets
+                            distance_matrix = 1 - np.dot(selected_features, selected_features.T)
+                            
+                            # Apply hierarchical clustering with desired number of clusters
+                            clustering = AgglomerativeClustering(
+                                n_clusters=target_class_size, 
+                                metric='precomputed',
+                                linkage='average'
+                            )
+                            clusters = clustering.fit_predict(distance_matrix)
+                        else:
+                            # For larger datasets, use direct clustering on features
+                            clustering = AgglomerativeClustering(
+                                n_clusters=target_class_size,
+                                metric='cosine',
+                                linkage='average'
+                            )
+                            clusters = clustering.fit_predict(selected_features)
+                        
+                        # For each cluster, find the most representative sample (closest to cluster center)
+                        final_selected = []
+                        final_weights = []
+                        
+                        for cluster_id in range(target_class_size):
+                            # Get indices of samples in this cluster
+                            cluster_samples = np.where(clusters == cluster_id)[0]
+                            
+                            if len(cluster_samples) == 0:
+                                continue
+                                
+                            # Get original indices
+                            cluster_original_indices = intermediate_selected[cluster_samples]
+                            
+                            # Calculate cluster center
+                            cluster_features = class_features[cluster_original_indices]
+                            cluster_center = np.mean(cluster_features, axis=0)
+                            
+                            # Find sample closest to center (most representative)
+                            similarities = np.dot(cluster_features, cluster_center)
+                            most_representative_idx = cluster_samples[np.argmax(similarities)]
+                            
+                            # Add to final selection
+                            final_selected.append(intermediate_selected[most_representative_idx])
+                            
+                            # Weight is proportional to cluster size
+                            final_weights.append(len(cluster_samples))
+                        
+                        # Convert to numpy arrays
+                        final_selected = np.array(final_selected, dtype=np.int32)
+                        final_weights = np.array(final_weights, dtype=np.float32)
+                        
+                        # Normalize weights if needed
+                        final_weights = final_weights / np.sum(final_weights) * len(final_weights)
+                        
+                        cluster_time = time.time() - cluster_start
+                        print(f"Class {cls}: Selected {len(final_selected)} samples after clustering. Clustering time: {cluster_time:.3f}s")
+                    else:
+                        # Not enough samples to cluster, use all intermediate results
+                        final_selected = intermediate_selected
+                        
+                        # Compute weights based on facility location
+                        cluster_sizes = np.zeros(len(final_selected), dtype=np.float32)
+                        for i in range(n_samples):
+                            if np.max(S[i, final_selected]) <= 0:
+                                continue
+                            # Assign each point to the most similar selected point
+                            cluster_sizes[np.argmax(S[i, final_selected])] += 1
+                            
+                        # Ensure no zero weights
+                        cluster_sizes[cluster_sizes == 0] = 1
+                        final_weights = cluster_sizes
+                        
+                    # Map back to global indices and add to results
+                    global_class_indices = class_indices[final_selected]
+                    all_selected_indices.extend(global_class_indices)
+                    all_selected_weights.extend(final_weights)
+                    
+                    fl_time = fl_prep_time + greedy_time
+                    total_class_time = time.time() - fl_time_start
+                    print(f"Class {cls}: selected {len(global_class_indices)}/{n_samples} samples, FL time: {fl_time:.3f}s, Total: {total_class_time:.3f}s")
+                
+                except Exception as e:
+                    print(f"Error selecting samples for class {cls}: {str(e)}")
+                    # Fall back to random selection for this class
+                    rand_indices = np.random.choice(
+                        class_indices, 
+                        size=min(target_class_size, len(class_indices)),
+                        replace=False
+                    )
+                    all_selected_indices.extend(rand_indices)
+                    all_selected_weights.extend(np.ones(len(rand_indices)))
+            
+            # Convert to numpy arrays
+            indices = np.array(all_selected_indices, dtype=np.int32)
+            weights = np.array(all_selected_weights, dtype=np.float32)
+            
+            selection_time = time.time() - start_time
+            print(f"Two-stage selection completed in {selection_time:.2f}s, selected {len(indices)} samples")
+            
+            return indices, weights
+            
+        except (ImportError, AttributeError) as e:
+            # Fall back to simpler implementation if required libraries not available
+            print(f"Error in two-stage selection: {e}")
+            raise ImportError("Required libraries not available for selection") from e
+
+    def _get_train_output_efficient(self, indices=None):
+            """
+            Efficiently compute model outputs for given indices with batching and parallel processing
+            
+            :param indices: Indices to compute outputs for (if None, compute for all data)
+            """
+            self.model.eval()
+            
+            # Determine which indices to process
+            if indices is None:
+                indices_to_process = self.train_indices
+            else:
+                indices_to_process = indices
+                
+            # Create dataset and dataloader for efficient processing
+            eval_dataset = Subset(self.train_dataset, indices_to_process)
+            eval_loader = DataLoader(
+                eval_dataset,
+                batch_size=self.inference_batch_size,  # Larger batch size for inference
+                shuffle=False,
+                num_workers=min(self.args.num_workers * 2, 16),  # More workers for inference
+                pin_memory=True
+            )
+            
+            # Initialize arrays if they don't exist
+            if not hasattr(self, 'train_output') or self.train_output.shape[0] != len(self.train_dataset):
+                self.train_output = np.zeros((len(self.train_dataset), self.args.num_classes))
+                self.train_softmax = np.zeros((len(self.train_dataset), self.args.num_classes))
+            
+            # Process batches in parallel if possible
+            with torch.no_grad():
+                for data, _, data_idx in eval_loader:
+                    data = data.to(self.args.device, non_blocking=True)
+                    
+                    # Use mixed precision for faster inference
+                    if self.use_mixed_precision:
+                        with torch.cuda.amp.autocast():
+                            output = self.model(data)
+                    else:
+                        output = self.model(data)
+                    
+                    # Compute softmax efficiently on GPU before transferring to CPU
+                    softmax_output = F.softmax(output, dim=1)
+                    
+                    # Update arrays
+                    self.train_output[data_idx] = output.cpu().numpy()
+                    self.train_softmax[data_idx] = softmax_output.cpu().numpy()
+            
+            self.model.train()

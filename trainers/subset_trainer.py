@@ -35,7 +35,8 @@ class SubsetTrainer(BaseTrainer):
             pin_memory=True
         )
         self.train_weights = np.zeros(len(self.train_dataset))
-        self.subset_weights = self.subset_weights / np.sum(self.subset_weights) * len(self.subset)
+        # self.subset_weights = self.subset_weights / np.sum(self.subset_weights) * len(self.subset) 
+        self.subset_weights = np.array(self.subset_weights) # remove normalization
         self.train_weights[self.subset] = self.subset_weights
         self.train_weights = torch.from_numpy(self.train_weights).float().to(self.args.device)
 

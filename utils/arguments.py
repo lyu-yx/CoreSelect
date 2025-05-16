@@ -27,6 +27,8 @@ def get_args():
         help="resume from a specific epoch")
     parser.add_argument("--batch_size", default=128, type=int,
         help="mini-batch size (default: 128)")
+    parser.add_argument("--inference_batch_size", default=512, type=int,
+        help="infer batch size (default: 512)")
     parser.add_argument("--lr", default=0.1, type=float,help="initial learning rate")
     parser.add_argument("--momentum", "-m", type=float, default=0.9, help="momentum")
     parser.add_argument("--weight-decay", "--wd", default=1e-4, type=float,
