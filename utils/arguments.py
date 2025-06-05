@@ -76,7 +76,9 @@ def get_args():
     parser.add_argument("--shuffle", default=True, type=parse_bool, const=True, nargs='?',
         help="use shuffled minibatch coreset")
     parser.add_argument("--subset_refresh_frequency", default=20, type=int, 
-        help="subset refresh frequency"),
+        help="subset refresh frequency")
+    parser.add_argument("--normalize_features", default=True, type=bool,
+        help="normalize features")
 
     # random subset options
     parser.add_argument("--random_subset_size", default=0.01, type=float, 

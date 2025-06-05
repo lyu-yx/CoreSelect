@@ -6,7 +6,6 @@ import time
 import torch.nn.functional as F
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
-import signal
 
 
 class CRESTTrainer(SubsetTrainer):
@@ -45,14 +44,14 @@ class CRESTTrainer(SubsetTrainer):
         default_max_subset = int(len(self.train_dataset) * self.args.train_frac)  # 10% of dataset
         self.max_subset_size = getattr(self.args, 'max_subset_size', default_max_subset)
         
-        # PERFORMANCE FOCUS: Update subset more frequently for better adaptation
-        self.subset_refresh_frequency = getattr(self.args, 'subset_refresh_frequency', 3)  # Every 3 epochs instead of 10
+        # Update subset less frequently for training stability and efficiency
+        self.subset_refresh_frequency = getattr(self.args, 'subset_refresh_frequency', 10)
         
         # Allow configuring the ratio between diversity and coverage
         self.dpp_weight = getattr(self.args, 'dpp_weight', 0.5)
         
-        # SIMPLIFIED: Remove normalize_features - always preserve magnitude for better performance
-        # self.args.normalize_features = getattr(self.args, 'normalize_features', False)
+        # Control whether to normalize features for selection
+        self.args.normalize_features = getattr(self.args, 'normalize_features', False)
         
         # Ensure drop_detrimental is False by default
         self.args.drop_detrimental = getattr(self.args, 'drop_detrimental', False)
@@ -77,12 +76,11 @@ class CRESTTrainer(SubsetTrainer):
         self.cached_epoch = -1
         self.similarity_cache = {}  # Initialize similarity matrix cache
                 
-        self.args.logger.info(f"PERFORMANCE-FOCUSED CREST trainer initialized:")
+        self.args.logger.info(f"High-Performance CREST trainer initialized:")
         self.args.logger.info(f"  - Max subset size: {self.max_subset_size} samples")
-        self.args.logger.info(f"  - Subset refresh frequency: Every {self.subset_refresh_frequency} epochs (frequent updates)")
-        self.args.logger.info(f"  - Features: Uncertainty-based (no complex gradient processing)")
-        self.args.logger.info(f"  - Stage 2: IMPLEMENTED (diversity reduction)")
-        self.args.logger.info(f"  - Fallback: Uncertainty-based selection (better than random)")
+        self.args.logger.info(f"  - Subset refresh frequency: Every {self.subset_refresh_frequency} epochs")
+        self.args.logger.info(f"  - DPP weight (diversity vs coverage): {self.dpp_weight}")
+        self.args.logger.info(f"  - Detrimental sample dropping: {self.args.drop_detrimental}")
         self.args.logger.info(f"  - Selection workers: {self.num_workers}")
         self.args.logger.info(f"  - Mixed precision training: {self.use_mixed_precision}")
         self.args.logger.info(f"  - Inference batch size: {self.inference_batch_size}")
@@ -239,20 +237,18 @@ class CRESTTrainer(SubsetTrainer):
         # Determine if we should sample based on dataset size
         # For large datasets, use sampling to speed up computation
         dataset_size = len(self.train_dataset)
-        large_dataset_threshold = 20000  # Much more reasonable threshold
+        large_dataset_threshold = dataset_size 
         
         if dataset_size > large_dataset_threshold:
-            # MUCH smaller sample size for efficiency - 5000 is still effective
-            sample_size = min(5000, dataset_size // 2)  # Maximum 5000 samples or half dataset
+            # Sample size proportional to dataset size but capped
+            sample_size = min(dataset_size, 50000)
             sample_indices = self._select_stratified_random(self.train_indices, sample_size)
             self._get_train_output_efficient(indices=sample_indices)
             pool_indices = sample_indices
-            self.args.logger.info(f"Large dataset detected ({dataset_size} samples). Sampling {sample_size} for efficiency.")
         else:
             # For smaller datasets, compute on the entire dataset
             self._get_train_output_efficient()
             pool_indices = self.train_indices
-            self.args.logger.info(f"Using all {dataset_size} samples for selection.")
             
 
         # Use cached data
@@ -345,23 +341,18 @@ class CRESTTrainer(SubsetTrainer):
         preds = self.train_softmax[pool_indices]
         targets = self.train_target[pool_indices]
         
-        # SIMPLIFIED: Use prediction uncertainty directly as features (no complex gradient processing)
-        # Compute uncertainty features - these are more meaningful than raw gradients
-        max_preds = np.max(preds, axis=1, keepdims=True)
-        entropy = -np.sum(preds * np.log(preds + 1e-8), axis=1, keepdims=True)
-        margin = (np.max(preds, axis=1) - np.partition(preds, -2, axis=1)[:, -2]).reshape(-1, 1)
-        
-        # Combine uncertainty features (no normalization to preserve magnitude information)
-        features = np.concatenate([preds, entropy, margin, max_preds], axis=1)
+        # Calculate gradient features for selection
+        one_hot_labels = np.zeros((len(targets), self.args.num_classes))
+        one_hot_labels[np.arange(len(targets)), targets] = 1
+        gradients = preds - one_hot_labels  # Gradient of cross-entropy w.r.t logits
         
         # Perform selection using mixed method
         selection_method = getattr(self.args, 'selection_method', 'mixed')
         
-        # EFFICIENCY CHECK: Use fast method for large pools
-        pool_size = len(pool_indices)
-        use_fast_method = pool_size > 3000  # Use fast method for pools larger than 3000
-        
-        if selection_method == "mixed" and not use_fast_method:
+        # Use internal selection implementation to prevent multiple calls to subset_generator
+        # This addresses the issue of multiple selection logs in the output
+        if selection_method == "mixed":
+            # Internal mixed selection implementation 
             start_time = time.time()
             
             # Process by class for better efficiency
@@ -377,78 +368,101 @@ class CRESTTrainer(SubsetTrainer):
                 idx_to_reduce = np.argmax(targets_per_class)
                 targets_per_class[idx_to_reduce] -= 1
             
+            class_prep_time = time.time() - start_time
+            
+            # Try to use the simplified facility location implementation
             try:
-                subset_indices, weights = self._fast_mixed_selection_fixed(features, targets, preds, targets_per_class, classes)
+                subset_indices, weights = self._fast_mixed_selection(gradients, targets, preds, targets_per_class, classes)
                 total_time = time.time() - start_time
-                print(f"Selection performance: {total_time:.2f}s")
+                
+                # Log timing information
+                print(f"Selection performance breakdown:")
+                print(f"  - Total time: {total_time:.2f}s")
+                print(f"  - Class preparation: {class_prep_time:.2f}s ({class_prep_time/total_time*100:.1f}%)")
                 
             except Exception as e:
-                self.args.logger.error(f"Error during _select_coreset: {str(e)}", exc_info=True)
+                self.args.logger.warning(f"Selection failed with error: {str(e)}")
+                self.args.logger.warning("Error details:", exc_info=True)
+                print(f"Error with _select_coreset: {str(e)}")
+                self.args.logger.error(f"Error during _select_coreset: {str(e)}", exc_info=True) # Added more detailed logging
                 
-                # Fallback to uncertainty-based selection (much better than random)
-                print("Falling back to uncertainty-based selection")
-                uncertainty_scores = entropy.flatten()
-                if len(uncertainty_scores) >= target_subset_size:
-                    # Select most uncertain samples
-                    uncertain_indices = np.argsort(uncertainty_scores)[-target_subset_size:]
-                    subset_indices = uncertain_indices
-                    # Weight by uncertainty (higher uncertainty = higher weight)
-                    weights = uncertainty_scores[subset_indices]
-                    weights = weights / np.sum(weights) * len(weights)  # Normalize
-                else:
-                    subset_indices = np.arange(len(pool_indices))
-                    weights = np.ones(len(subset_indices))
+                # Fallback to random selection
+                subset_indices = np.random.choice(
+                    np.arange(len(pool_indices)), 
+                    size=min(target_subset_size, len(pool_indices)),
+                    replace=False
+                )
+                weights = np.ones(len(subset_indices))
                 
+        # TODO: Implement other selection methods if needed
         else:
-            # Use fast uncertainty-based selection for large pools or non-mixed methods
-            if use_fast_method:
-                self.args.logger.info(f"Large pool ({pool_size} samples) detected. Using fast uncertainty-based selection.")
-            else:
-                self.args.logger.warning(f"Selection method '{selection_method}' not implemented. Using uncertainty-based selection.")
+            # Fallback to random subset selection if method is not implemented
+            self.args.logger.warning(f"Selection method '{selection_method}' not implemented. Using random selection.")
             
-            # Process by class for better efficiency
-            classes = np.unique(targets)
-            class_counts = [np.sum(targets == c) for c in classes]
-            class_fractions = np.array(class_counts) / len(targets)
-            
-            # Calculate target size per class
-            targets_per_class = np.int32(np.ceil(class_fractions * target_subset_size))
-            
-            # Ensure we don't select more than subset_size
-            while np.sum(targets_per_class) > target_subset_size:
-                idx_to_reduce = np.argmax(targets_per_class)
-                targets_per_class[idx_to_reduce] -= 1
-            
-            start_time = time.time()
-            subset_indices, weights = self._fast_uncertainty_selection(features, targets, preds, targets_per_class, classes)
-            total_time = time.time() - start_time
-            print(f"Fast uncertainty selection performance: {total_time:.2f}s")
+            # Generate random subset
+            subset_indices = np.random.choice(
+                np.arange(len(pool_indices)), 
+                size=min(target_subset_size, len(pool_indices)),
+                replace=False
+            )
+            weights = np.ones(len(subset_indices))
         
         # Map local indices back to global
         global_indices = pool_indices[subset_indices]
         return global_indices, weights
 
-    def _fast_mixed_selection_fixed(self, features, labels, softmax_preds, targets_per_class, classes):
+    def _fast_mixed_selection(self, features, labels, softmax_preds, targets_per_class, classes):
         """
-        FIXED implementation with proper Stage 2 diversity reduction
-        Focus: Performance > Efficiency, with minimal unnecessary normalization
-        OPTIMIZED: Added efficiency controls and smaller selection sizes
+        Improved implementation of mixed selection using a two-stage approach:
+        1. Select a larger intermediate subset based on coverage
+        2. Cluster similar instances and reduce to the final subset
+        
+        Args:
+            features: Feature vectors for samples
+            labels: Class labels
+            softmax_preds: Model predictions
+            targets_per_class: Number of samples to select per class
+            classes: Unique class labels
+            
+        Returns:
+            Tuple of (selected indices, selection weights)
         """
         try:
-            from submodlib import FacilityLocationFunction
+            from submodlib import FacilityLocationFunction, LogDeterminantFunction
+            from sklearn.cluster import AgglomerativeClustering
+            import scipy.spatial.distance as distance
             
+            # Control feature normalization with a parameter
+            # For gradients, this should typically be False to preserve magnitude information
+            normalize_features = getattr(self.args, 'normalize_features', False)
+            
+            print(f"Implementing two-stage selection for coverage + diversity (normalize_features={normalize_features})")
+            
+            # Track execution time
+            start_time = time.time()
+            
+            # Process original features or normalize them based on the parameter
+            if normalize_features:
+                # Normalize features for similarity computation (preserves direction only)
+                norms = np.linalg.norm(features, axis=1, keepdims=True)
+                norms[norms == 0] = 1.0
+                processed_features = features / norms
+                print("Using normalized features (direction only)")
+            else:
+                # Use original features (preserves both direction and magnitude)
+                processed_features = features.copy()
+                print("Using original features (preserving magnitude)")
+            
+            # Process each class separately
             all_selected_indices = []
             all_selected_weights = []
-            
-            # Add timeout handling for very slow operations
-            def timeout_handler(signum, frame):
-                raise TimeoutError("Selection taking too long")
             
             for c_idx, cls in enumerate(classes):
                 target_class_size = targets_per_class[c_idx]
                 if target_class_size <= 0:
                     continue
                 
+                # Get class-specific data
                 class_mask = (labels == cls)
                 class_indices = np.where(class_mask)[0]
                 
@@ -456,150 +470,124 @@ class CRESTTrainer(SubsetTrainer):
                     continue
                 
                 if len(class_indices) <= target_class_size:
+                    # If we have fewer samples than target, use all available
                     all_selected_indices.extend(class_indices)
                     all_selected_weights.extend(np.ones(len(class_indices)))
                     continue
                 
-                # EFFICIENCY CONTROL: For very large classes, pre-sample to reasonable size
-                max_class_size = 2000  # Maximum samples per class to consider
-                if len(class_indices) > max_class_size:
-                    # Pre-select most uncertain samples
-                    class_preds = softmax_preds[class_indices]
-                    class_uncertainty = -np.sum(class_preds * np.log(class_preds + 1e-8), axis=1)
-                    top_uncertain = np.argsort(class_uncertainty)[-max_class_size:]
-                    class_indices = class_indices[top_uncertain]
-                    self.args.logger.info(f"Class {cls}: Pre-selected {len(class_indices)} most uncertain from {len(np.where(class_mask)[0])} samples")
-                
-                # Extract class features - NO normalization to preserve magnitude
-                class_features = features[class_indices]
+                # Extract class features
+                class_features = processed_features[class_indices]
                 n_samples = len(class_features)
                 
-                # STAGE 1: Select intermediate set using facility location (SMALLER multiplier)
-                intermediate_size = min(n_samples, max(target_class_size, int(target_class_size * 1.2)))  # Only 1.2x instead of 1.5x
+                # STAGE 1: Initial coverage-based selection (facility location)
+                # Select larger intermediate subset (2x target size, but capped)
+                intermediate_size = min(n_samples, int(target_class_size * 2))
                 
-                self.args.logger.info(f"Class {cls}: Selecting {intermediate_size} from {n_samples} samples...")
+                # Use dense mode for smaller datasets, sparse for larger ones
+                use_dense = n_samples <= 5000  # Threshold adjusted for performance
+                mode = "dense" if use_dense else "sparse"
                 
+                # Create facility location object
+                fl_time_start = time.time()
                 try:
-                    # Set timeout for facility location (30 seconds max per class)
-                    signal.signal(signal.SIGALRM, timeout_handler)
-                    signal.alarm(30)
-                    
-                    # OPTIMIZED: Use simpler similarity for large feature sets
-                    if class_features.shape[1] > 50:
-                        # Use PCA or random projection to reduce feature dimensionality
-                        from sklearn.decomposition import PCA
-                        pca = PCA(n_components=min(50, class_features.shape[1]))
-                        reduced_features = pca.fit_transform(class_features)
+                    if use_dense:
+                        # For dense mode, precompute similarity matrix
+                        # If not normalized, we need to be careful with similarity computation
+                        if normalize_features:
+                            # For normalized features, dot product directly gives cosine similarity
+                            similarity_matrix = np.dot(class_features, class_features.T)
+                        else:
+                            # For unnormalized features, we compute a scaled similarity
+                            # This helps prevent numerical issues with very large magnitudes
+                            # while still preserving relative magnitudes
+                            magnitudes = np.linalg.norm(class_features, axis=1, keepdims=True)
+                            max_magnitude = np.max(magnitudes)
+                            if max_magnitude > 0:
+                                scaled_features = class_features / max_magnitude
+                                similarity_matrix = np.dot(scaled_features, scaled_features.T)
+                                print(f"  Class {cls}: Used scaled dot product for similarity (max_magnitude: {max_magnitude:.2f})")
+                            else:
+                                # All features are zero vectors
+                                similarity_matrix = np.zeros((n_samples, n_samples))
+                                print(f"  Class {cls}: All features are zero, using zero similarity matrix.")
+                        fl_obj = FacilityLocationFunction(
+                            n=n_samples,
+                            mode="dense",
+                            sijs=similarity_matrix,
+                            separate_rep=False
+                        )
                     else:
-                        reduced_features = class_features
+                        # For sparse mode, let submodlib compute similarities as needed
+                        # Specify appropriate metric based on whether features are normalized
+                        metric = "cosine" if normalize_features else "euclidean"
+                        fl_obj = FacilityLocationFunction(
+                            n=n_samples,
+                            mode="sparse",
+                            data=class_features,
+                            metric=metric,
+                            num_neighbors=min(128, n_samples - 1)
+                        )
+                        
+                    fl_prep_time = time.time() - fl_time_start
                     
-                    # Simple similarity computation without over-normalization
-                    similarity_matrix = np.dot(reduced_features, reduced_features.T)
-                    
-                    # Facility location for coverage
-                    fl_obj = FacilityLocationFunction(
-                        n=n_samples,
-                        mode="dense",
-                        sijs=similarity_matrix,
-                        separate_rep=False
-                    )
-                    
-                    intermediate_list = fl_obj.maximize(
+                    # Run lazy greedy selection
+                    greedy_start = time.time()
+                    intermediate_greedy_list = fl_obj.maximize(
                         budget=intermediate_size,
                         optimizer="LazyGreedy",
-                        stopIfZeroGain=True,  # Stop early if no improvement
-                        stopIfNegativeGain=True,
+                        stopIfZeroGain=False,
+                        stopIfNegativeGain=False,
                         verbose=False
                     )
+                    greedy_time = time.time() - greedy_start
                     
-                    signal.alarm(0)  # Cancel timeout
-                    intermediate_selected = [x[0] for x in intermediate_list]
+                    # Extract the initial selected points
+                    intermediate_selected = [x[0] for x in intermediate_greedy_list]
+                    intermediate_selected = np.array(intermediate_selected, dtype=np.int32)
                     
-                except (TimeoutError, Exception) as e:
-                    signal.alarm(0)  # Cancel timeout
-                    self.args.logger.warning(f"Class {cls}: Facility location failed ({str(e)}), using uncertainty-based selection")
+                    # Get similarity matrix for selected points
+                    if use_dense:
+                        # Already computed
+                        S = similarity_matrix
+                    else:
+                        # Use the similarity matrix from facility location
+                        S = fl_obj.sijs
+                        
+                    # STAGE 2: Redundancy reduction through clustering
+                    # If we have more than target size after initial selection
+                    self.args.logger.info(f"Class {cls}: STAGE 2 (Clustering/DPP) is a placeholder and not fully implemented.")
+                    # For now, we'll just use the result from STAGE 1 if it's already at or below target_class_size
+                    # or truncate if it's larger. A proper DPP or clustering step would go here.
+                    if len(intermediate_selected) > target_class_size:
+                        self.args.logger.info(f"Class {cls}: Truncating intermediate selection from {len(intermediate_selected)} to {target_class_size}")
+                        final_selected_indices_for_class = intermediate_selected[:target_class_size]
+                    else:
+                        final_selected_indices_for_class = intermediate_selected
                     
-                    # Fallback: Select most uncertain samples
-                    class_preds = softmax_preds[class_indices]
-                    uncertainty = -np.sum(class_preds * np.log(class_preds + 1e-8), axis=1)
-                    intermediate_selected = np.argsort(uncertainty)[-intermediate_size:].tolist()
-                
-                # STAGE 2: FIXED - Diversity reduction using greedy selection
-                if len(intermediate_selected) > target_class_size:
-                    # Use uncertainty + diversity for final selection
-                    intermediate_features = class_features[intermediate_selected]
-                    intermediate_preds = softmax_preds[class_indices[intermediate_selected]]
-                    
-                    # Compute uncertainty scores for intermediate samples
-                    uncertainty = -np.sum(intermediate_preds * np.log(intermediate_preds + 1e-8), axis=1)
-                    
-                    # SIMPLIFIED Greedy selection: Just use uncertainty ranking for speed
-                    final_indices = np.argsort(uncertainty)[-target_class_size:].tolist()
-                    
-                else:
-                    final_indices = intermediate_selected
-                
-                # Add to global selection
-                all_selected_indices.extend(class_indices[final_indices])
-                
-                # Weight by uncertainty (higher uncertainty = higher weight)
-                if final_indices:
-                    final_preds = softmax_preds[class_indices[final_indices]]
-                    final_uncertainty = -np.sum(final_preds * np.log(final_preds + 1e-8), axis=1)
-                    # Normalize uncertainties to create weights
-                    weights = final_uncertainty / (np.sum(final_uncertainty) + 1e-8) * len(final_indices)
-                    all_selected_weights.extend(weights)
+                    all_selected_indices.extend(class_indices[final_selected_indices_for_class])
+                    all_selected_weights.extend(np.ones(len(final_selected_indices_for_class)))
+
+                except Exception as e:
+                    self.args.logger.error(f"Error in _fast_mixed_selection for class {cls}: {str(e)}", exc_info=True)
+                    self.args.logger.warning(f"Class {cls}: Falling back to random selection for this class due to error.")
+                    # Fallback for this class: select randomly if an error occurs
+                    num_to_select_for_class_fallback = min(target_class_size, len(class_indices))
+                    if len(class_indices) > 0 and num_to_select_for_class_fallback > 0:
+                        fallback_indices = np.random.choice(class_indices, size=num_to_select_for_class_fallback, replace=False)
+                        all_selected_indices.extend(fallback_indices)
+                        all_selected_weights.extend(np.ones(len(fallback_indices)))
+            
+            if not all_selected_indices: # If no samples were selected (e.g., all classes had errors or were empty)
+                self.args.logger.warning("No samples selected in _fast_mixed_selection. Returning empty selection.")
+                return np.array([]), np.array([])
 
             return np.array(all_selected_indices, dtype=np.int32), np.array(all_selected_weights)
             
-        except Exception as e:
-            self.args.logger.error(f"Error in _fast_mixed_selection_fixed: {str(e)}", exc_info=True)
+        except (ImportError, AttributeError) as e:
+            self.args.logger.error(f"Missing dependencies (submodlib or sklearn) for _fast_mixed_selection: {str(e)}", exc_info=True)
+            # Re-raise critical dependency errors, as the function cannot operate as intended.
             raise e
-    
-    
-    def _select_stratified_random(self, indices, sample_size):
-        """
-        Perform stratified random sampling to maintain class distribution
-        
-        :param indices: Array of indices to sample from
-        :param sample_size: Number of samples to select
-        :return: Selected indices
-        """
-        # Get targets for the given indices
-        targets = self.train_target[indices]
-        
-        # Get unique classes and their counts
-        unique_classes, class_counts = np.unique(targets, return_counts=True)
-        total_samples = len(indices)
-        
-        selected_indices = []
-        
-        for cls, count in zip(unique_classes, class_counts):
-            # Calculate proportional sample size for this class
-            class_proportion = count / total_samples
-            class_sample_size = int(np.ceil(class_proportion * sample_size))
-            
-            # Get indices for this class
-            class_mask = (targets == cls)
-            class_indices = indices[class_mask]
-            
-            # Sample from this class
-            if len(class_indices) <= class_sample_size:
-                # If we have fewer samples than needed, take all
-                selected_indices.extend(class_indices)
-            else:
-                # Randomly sample the required number
-                sampled = np.random.choice(class_indices, size=class_sample_size, replace=False)
-                selected_indices.extend(sampled)
-        
-        # Convert to numpy array and ensure we don't exceed sample_size
-        selected_indices = np.array(selected_indices)
-        
-        if len(selected_indices) > sample_size:
-            # If we have too many due to rounding up, randomly subsample
-            selected_indices = np.random.choice(selected_indices, size=sample_size, replace=False)
-        
-        return selected_indices
+
     def _get_train_output_efficient(self, indices=None):
             """
             Efficiently compute model outputs for given indices with batching and parallel processing
@@ -649,46 +637,3 @@ class CRESTTrainer(SubsetTrainer):
                     self.train_softmax[data_idx] = softmax_output.cpu().numpy()
             
             self.model.train()
-
-    def _fast_uncertainty_selection(self, features, labels, softmax_preds, targets_per_class, classes):
-        """
-        Fast fallback selection method using only uncertainty ranking
-        Much faster than facility location for large datasets
-        """
-        all_selected_indices = []
-        all_selected_weights = []
-        
-        for c_idx, cls in enumerate(classes):
-            target_class_size = targets_per_class[c_idx]
-            if target_class_size <= 0:
-                continue
-            
-            class_mask = (labels == cls)
-            class_indices = np.where(class_mask)[0]
-            
-            if len(class_indices) == 0:
-                continue
-                
-            if len(class_indices) <= target_class_size:
-                all_selected_indices.extend(class_indices)
-                all_selected_weights.extend(np.ones(len(class_indices)))
-                continue
-            
-            # Get predictions for this class
-            class_preds = softmax_preds[class_indices]
-            
-            # Compute uncertainty (entropy)
-            uncertainty = -np.sum(class_preds * np.log(class_preds + 1e-8), axis=1)
-            
-            # Select most uncertain samples
-            most_uncertain_indices = np.argsort(uncertainty)[-target_class_size:]
-            selected_class_indices = class_indices[most_uncertain_indices]
-            
-            all_selected_indices.extend(selected_class_indices)
-            
-            # Weight by uncertainty
-            selected_uncertainty = uncertainty[most_uncertain_indices]
-            weights = selected_uncertainty / (np.sum(selected_uncertainty) + 1e-8) * len(selected_uncertainty)
-            all_selected_weights.extend(weights)
-        
-        return np.array(all_selected_indices, dtype=np.int32), np.array(all_selected_weights) 
